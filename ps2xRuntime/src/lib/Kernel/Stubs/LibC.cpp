@@ -534,7 +534,7 @@ namespace ps2_stubs
             {
                 rendered.resize(2048);
             }
-            PS2_IF_AGRESSIVE_LOGS({
+            do {
                 const std::string logLine = sanitizeForLog(rendered);
                 uint32_t count = 0;
                 {
@@ -550,7 +550,7 @@ namespace ps2_stubs
                 {
                     std::cerr << "PS2 printf logging suppressed after " << kMaxPrintfLogs << " lines" << std::endl;
                 }
-            });
+            } while (0);
             ret = static_cast<int>(rendered.size());
         }
         else

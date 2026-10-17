@@ -63,13 +63,21 @@ namespace ps2_stubs
             g_cdStreamTiming.lastVSyncTick = currentCdStreamTick(runtime);
         }
 
+        // Reads may continue into the zero-filled tail after the file (as a real drive would keep
+        // reading), while EOF is still reported at the real end of the file.
+        uint32_t cdStreamReadLimitLbn()
+        {
+            return g_cdStreamingEndLbn == 0xFFFFFFFFu ? 0xFFFFFFFFu : g_cdStreamingEndLbn + kCdStreamTailPadSectors;
+        }
+
         uint64_t totalCdStreamSectors()
         {
-            if (g_cdStreamingEndLbn == 0xFFFFFFFFu || g_cdStreamingEndLbn < g_cdStreamingLbn)
+            const uint32_t limitLbn = cdStreamReadLimitLbn();
+            if (limitLbn == 0xFFFFFFFFu || limitLbn < g_cdStreamingLbn)
             {
                 return std::numeric_limits<uint64_t>::max();
             }
-            return g_cdStreamTiming.consumedSectors + static_cast<uint64_t>(g_cdStreamingEndLbn - g_cdStreamingLbn);
+            return g_cdStreamTiming.consumedSectors + static_cast<uint64_t>(limitLbn - g_cdStreamingLbn);
         }
 
         void updateCdStreamProduction(PS2Runtime *runtime)
@@ -732,16 +740,17 @@ namespace ps2_stubs
             {
                 uint32_t remaining = state.requestedSectors - state.sectorsRead;
                 bool atEnd = false;
-                if (g_cdStreamingEndLbn != 0xFFFFFFFFu)
+                const uint32_t readLimitLbn = cdStreamReadLimitLbn();
+                if (readLimitLbn != 0xFFFFFFFFu)
                 {
-                    if (g_cdStreamingLbn >= g_cdStreamingEndLbn)
+                    if (g_cdStreamingLbn >= readLimitLbn)
                     {
                         remaining = 0u;
                         atEnd = true;
                     }
                     else
                     {
-                        const uint32_t streamRemaining = g_cdStreamingEndLbn - g_cdStreamingLbn;
+                        const uint32_t streamRemaining = readLimitLbn - g_cdStreamingLbn;
                         if (remaining > streamRemaining)
                         {
                             remaining = streamRemaining;
@@ -837,7 +846,7 @@ namespace ps2_stubs
                     ++g_cdStReadTraceCount;
                 }
 
-                if (state.sectorsRead >= state.requestedSectors || hitStreamEnd)
+                if (state.sectorsRead >= state.requestedSectors || g_cdStreamingLbn >= readLimitLbn)
                 {
                     finishCdStRead(rdram, ctx, state, 0);
                     return;
@@ -880,10 +889,11 @@ namespace ps2_stubs
         }
 
         uint32_t remaining = requestedSectors;
-        if (g_cdStreamingEndLbn != 0xFFFFFFFFu)
+        const uint32_t readLimitLbn = cdStreamReadLimitLbn();
+        if (readLimitLbn != 0xFFFFFFFFu)
         {
-            remaining = g_cdStreamingLbn < g_cdStreamingEndLbn
-                            ? std::min(remaining, g_cdStreamingEndLbn - g_cdStreamingLbn)
+            remaining = g_cdStreamingLbn < readLimitLbn
+                            ? std::min(remaining, readLimitLbn - g_cdStreamingLbn)
                             : 0u;
         }
 
