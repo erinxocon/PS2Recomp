@@ -104,6 +104,11 @@ namespace ps2recomp
                 config.skipFunctions = toml::find<std::vector<std::string>>(data, "skip");
             }
 
+            if (general.contains("native") && general.at("native").is_array())
+            {
+                config.nativeFunctions = toml::find<std::vector<std::string>>(general, "native");
+            }
+
             if (data.contains("patches") && data.at("patches").is_table())
             {
                 const auto &patches = toml::find(data, "patches");
@@ -296,6 +301,7 @@ namespace ps2recomp
         general["patch_cop0"] = config.patchCop0;
         general["patch_cache"] = config.patchCache;
         general["skip"] = config.skipFunctions;
+        general["native"] = config.nativeFunctions;
         general["stubs"] = config.stubImplementations;
         general["entry_points"] = config.entryPointHints;
         data["general"] = general;
