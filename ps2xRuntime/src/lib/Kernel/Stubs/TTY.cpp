@@ -13,7 +13,7 @@ namespace ps2_stubs
         std::string rendered = formatPs2StringWithArgs(rdram, ctx, runtime, formatOwned.c_str(), 1);
         if (rendered.size() > 2048)
             rendered.resize(2048);
-        PS2_IF_AGRESSIVE_LOGS({
+        do {
             const std::string logLine = sanitizeForLog(rendered);
             uint32_t count = 0;
             {
@@ -29,7 +29,7 @@ namespace ps2_stubs
             {
                 std::cerr << "PS2 printf logging suppressed after " << kMaxPrintfLogs << " lines" << std::endl;
             }
-        });
+        } while (0);
     }
 
     void sceResetttyinit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
