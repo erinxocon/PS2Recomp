@@ -67,6 +67,8 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::vector<Instruction>> m_decodedFunctions;
         std::unordered_map<std::string, bool> m_skipFunctions;
         std::unordered_set<uint32_t> m_skipFunctionStarts;
+        std::unordered_set<std::string> m_nativeFunctions;
+        std::unordered_set<uint32_t> m_nativeFunctionStarts;
         std::unordered_set<std::string> m_stubFunctions;
         std::unordered_set<uint32_t> m_stubFunctionStarts;
         std::unordered_map<uint32_t, std::string> m_stubHandlerBindingsByStart;

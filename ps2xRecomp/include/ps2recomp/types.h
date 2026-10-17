@@ -185,6 +185,8 @@ namespace ps2recomp
         bool patchCop0 = true;
         bool patchCache = true;
         std::vector<std::string> skipFunctions;
+        // Names or name@0xADDR selectors that must be recompiled even if their name matches a runtime handler.
+        std::vector<std::string> nativeFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;
         std::vector<std::string> entryPointHints;
