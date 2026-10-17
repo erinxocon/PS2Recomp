@@ -149,6 +149,12 @@ namespace ps2x::iop::detail
         case 16:
         case 17:
             setV0(0);
+            if (m_currentThread == nullptr)
+            {
+                if (m_nestedWait)
+                    m_nestedWait([first = true](uint64_t) mutable { const bool done = !first; first = false; return done; });
+                return true;
+            }
             cpu.yielded = true;
             return true;
         case 18:
@@ -415,6 +421,26 @@ namespace ps2x::iop::detail
                 cpu.yielded = true;
                 setV0(0);
             }
+            else
+            {
+                // Nested call: let the threads that signal this semaphore run, then take it.
+                if (m_nestedWait)
+                    m_nestedWait([this, id](uint64_t)
+                                 {
+                                     const auto sem = m_semaphores.find(id);
+                                     return sem == m_semaphores.end() || sem->second.current > 0;
+                                 });
+                const auto sem = m_semaphores.find(id);
+                if (sem != m_semaphores.end() && sem->second.current > 0)
+                {
+                    --sem->second.current;
+                    setV0(0);
+                }
+                else
+                {
+                    setV0(static_cast<uint32_t>(-1));
+                }
+            }
             return true;
         }
         case 11:
@@ -655,7 +681,11 @@ namespace ps2x::iop::detail
     void IopKernel::sleepCurrent(IopCpuState &cpu)
     {
         if (m_currentThread == nullptr)
+        {
+            if (m_nestedWait)
+                m_nestedWait([first = true](uint64_t) mutable { const bool done = !first; first = false; return done; });
             return;
+        }
         m_currentThread->state = IopThreadState::Sleep;
         cpu.yielded = true;
     }
@@ -663,7 +693,11 @@ namespace ps2x::iop::detail
     void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu)
     {
         if (m_currentThread == nullptr)
+        {
+            if (m_nestedWait)
+                m_nestedWait([wakeCycle](uint64_t cycle) { return cycle >= wakeCycle; });
             return;
+        }
         m_currentThread->wakeCycle = wakeCycle;
         m_currentThread->state = IopThreadState::Delay;
         cpu.yielded = true;
