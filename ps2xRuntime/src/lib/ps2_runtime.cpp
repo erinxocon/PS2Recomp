@@ -390,7 +390,11 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        // The guest latches the scanned-out picture at every VBlank (see
+        // EeScheduler::processEvent), so the host only has to pick it up.
+        // Before the first VBlank there is nothing latched yet.
+        if (currentTick == 0u)
+            rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -471,10 +475,163 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
     }
 
+    // Low-resolution progressive modes (e.g. 640x224 non-interlaced) are
+    // line-doubled so the host image (and frame dumps) always have the
+    // TV's 2:1 line aspect. Interlaced field buffers are already rebuilt to
+    // full height by the GS presentation path.
+    if (height != 0u && height <= static_cast<uint32_t>(FB_HEIGHT / 2))
+    {
+        const size_t rowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        for (uint32_t y = height; y-- > 0u;)
+        {
+            std::memcpy(s_uploadBuffer.data() + (2u * y + 1u) * rowBytes, s_uploadBuffer.data() + y * rowBytes, rowBytes);
+            if (y != 0u)
+                std::memcpy(s_uploadBuffer.data() + (2u * y) * rowBytes, s_uploadBuffer.data() + y * rowBytes, rowBytes);
+        }
+        height *= 2u;
+    }
+    // Repeat the last row/column into the padding so bilinear filtering does
+    // not bleed black into the picture edge.
+    if (height != 0u && width != 0u)
+    {
+        const size_t rowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const uint32_t usedHeight = std::min<uint32_t>(height, FB_HEIGHT);
+        const uint32_t usedWidth = std::min<uint32_t>(width, FB_WIDTH);
+        if (usedWidth < static_cast<uint32_t>(FB_WIDTH))
+        {
+            for (uint32_t y = 0; y < usedHeight; ++y)
+                std::memcpy(s_uploadBuffer.data() + y * rowBytes + usedWidth * 4u,
+                            s_uploadBuffer.data() + y * rowBytes + (usedWidth - 1u) * 4u, 4u);
+        }
+        if (usedHeight < static_cast<uint32_t>(FB_HEIGHT))
+            std::memcpy(s_uploadBuffer.data() + usedHeight * rowBytes,
+                        s_uploadBuffer.data() + (usedHeight - 1u) * rowBytes, rowBytes);
+    }
+
     UpdateTexture(tex, s_uploadBuffer.data());
     outWidth = width;
     outHeight = height;
+    s_lastWidth = width;
+    s_lastHeight = height;
     s_hasUploadedFrame = true;
+
+    // PS2X_DUMP_RAM_TICK=<tick> writes the 32MB EE RAM to <PS2X_DUMP_FRAMES or cwd>/ram_<tick>.bin once.
+    static const long s_dumpRamTick = []()
+    {
+        const char *value = std::getenv("PS2X_DUMP_RAM_TICK");
+        return value ? std::strtol(value, nullptr, 0) : -1L;
+    }();
+    static bool s_ramDumped = false;
+    if (s_dumpRamTick >= 0 && !s_ramDumped && currentTick >= static_cast<uint64_t>(s_dumpRamTick))
+    {
+        s_ramDumped = true;
+        const char *dir = std::getenv("PS2X_DUMP_FRAMES");
+        char path[1024];
+        std::snprintf(path, sizeof(path), "%s/ram_%06llu.bin", (dir && *dir) ? dir : ".",
+                      static_cast<unsigned long long>(currentTick));
+        std::ofstream ramOut(path, std::ios::binary);
+        ramOut.write(reinterpret_cast<const char *>(rt->memory().getRDRAM()), PS2_RAM_SIZE);
+        std::cout << "[dump] wrote " << path << std::endl;
+    }
+
+    // PS2X_TRACE_GS=1 prints GS activity counters once per 60 presented frames.
+    static const bool s_traceGs = std::getenv("PS2X_TRACE_GS") != nullptr;
+    if (s_traceGs)
+    {
+        static uint32_t s_traceCounter = 0u;
+        if ((s_traceCounter++ % 60u) == 0u)
+        {
+            auto &tc = rt->gs().traceCounters();
+            const GSRegisters &regs = rt->memory().gs();
+            std::cout << "[trace:gs] tick=" << currentTick
+                      << " gif=" << tc.gifPackets.load()
+                      << " trx=" << tc.transfers.load()
+                      << " imgBytes=" << tc.imageBytes.load()
+                      << " draws=" << tc.draws.load()
+                      << " lastDrawFbp=" << tc.lastDrawFbp.load()
+                      << " lastPrim=" << tc.lastDrawPrim.load()
+                      << " lastTrxDbp=0x" << std::hex << tc.lastTransferDbp.load()
+                      << " pmode=0x" << regs.pmode
+                      << " dispfb1=0x" << regs.dispfb1
+                      << " dispfb2=0x" << regs.dispfb2 << std::dec
+                      << " presented=" << width << "x" << height
+                      << " srcFbp=" << sourceFbp << std::endl;
+        }
+    }
+
+    // PS2X_DUMP_FRAMES=<dir> writes every PS2X_DUMP_EVERY-th presented frame (default 60) as PNG.
+    static const char *s_dumpDir = std::getenv("PS2X_DUMP_FRAMES");
+    if (s_dumpDir && *s_dumpDir)
+    {
+        static const uint32_t s_dumpEvery = []()
+        {
+            const char *every = std::getenv("PS2X_DUMP_EVERY");
+            const long value = every ? std::strtol(every, nullptr, 10) : 60;
+            return static_cast<uint32_t>(value > 0 ? value : 60);
+        }();
+        static uint32_t s_dumpCounter = 0u;
+        if ((s_dumpCounter++ % s_dumpEvery) == 0u && width != 0u && height != 0u)
+        {
+            Image image{};
+            image.data = s_uploadBuffer.data();
+            image.width = static_cast<int>(FB_WIDTH);
+            image.height = static_cast<int>(std::min<uint32_t>(height, FB_HEIGHT));
+            image.mipmaps = 1;
+            image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            char path[1024];
+            std::snprintf(path, sizeof(path), "%s/frame_%06llu.png", s_dumpDir,
+                          static_cast<unsigned long long>(currentTick));
+            ExportImage(image, path);
+
+            // PS2X_DUMP_TEX=tbp,tbw,psm,w,h also writes that texture's raw texel values (low byte) as grey.
+            static const char *s_dumpTex = std::getenv("PS2X_DUMP_TEX");
+            if (s_dumpTex)
+            {
+                unsigned tbp = 0, tbw = 0, psm = 0, tw = 0, th = 0;
+                if (std::sscanf(s_dumpTex, "%i,%i,%i,%i,%i", &tbp, &tbw, &psm, &tw, &th) == 5 && tw && th)
+                {
+                    std::vector<uint8_t> grey(static_cast<size_t>(tw) * th);
+                    for (uint32_t y = 0; y < th; ++y)
+                        for (uint32_t x = 0; x < tw; ++x)
+                            grey[y * tw + x] = static_cast<uint8_t>(rt->gs().ReadVram(psm, tbp, tbw, x, y));
+                    Image tex{};
+                    tex.data = grey.data();
+                    tex.width = static_cast<int>(tw);
+                    tex.height = static_cast<int>(th);
+                    tex.mipmaps = 1;
+                    tex.format = PIXELFORMAT_UNCOMPRESSED_GRAYSCALE;
+                    std::snprintf(path, sizeof(path), "%s/tex_%06llu.png", s_dumpDir,
+                                  static_cast<unsigned long long>(currentTick));
+                    ExportImage(tex, path);
+                }
+            }
+
+            // PS2X_DUMP_VRAM=1 also writes all 4MB of GS memory viewed as 640-wide PSMCT32.
+            static const bool s_dumpVram = std::getenv("PS2X_DUMP_VRAM") != nullptr;
+            if (s_dumpVram)
+            {
+                constexpr uint32_t kVramWidth = 640u;
+                constexpr uint32_t kVramHeight = (4u * 1024u * 1024u) / (kVramWidth * 4u);
+                static std::vector<uint32_t> s_vram(kVramWidth * kVramHeight);
+                for (uint32_t y = 0; y < kVramHeight; ++y)
+                {
+                    for (uint32_t x = 0; x < kVramWidth; ++x)
+                    {
+                        s_vram[y * kVramWidth + x] = rt->gs().ReadVram(0u, 0u, kVramWidth / 64u, x, y) | 0xFF000000u;
+                    }
+                }
+                Image vram{};
+                vram.data = s_vram.data();
+                vram.width = static_cast<int>(kVramWidth);
+                vram.height = static_cast<int>(kVramHeight);
+                vram.mipmaps = 1;
+                vram.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                std::snprintf(path, sizeof(path), "%s/vram_%06llu.png", s_dumpDir,
+                              static_cast<unsigned long long>(currentTick));
+                ExportImage(vram, path);
+            }
+        }
+    }
 }
 
 PS2Runtime::PS2Runtime()
@@ -1148,6 +1305,11 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         }
     }
 
+    if (canInterpretGuestCode(address))
+    {
+        return &PS2Runtime::interpretGuestCode;
+    }
+
     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
               << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
@@ -1342,6 +1504,10 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+// Counts generated-code checkpoint yields, so dispatchGuestBranch can tell a callee that was
+// preempted on a loop back-edge to its own entry apart from one that never set the pc.
+static uint64_t g_eeCheckpointYields = 0;
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1358,12 +1524,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        ++g_eeCheckpointYields;
         return false;
     }
 
+    const bool interpreted = !hasFunction(targetPc) && canInterpretGuestCode(targetPc);
+
     if (!isCall)
     {
-        if (!hasFunction(targetPc))
+        if (!hasFunction(targetPc) && !interpreted)
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
         }
@@ -1372,7 +1541,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (!hasFunction(targetPc))
+    if (!hasFunction(targetPc) && !interpreted)
     {
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
@@ -1396,6 +1565,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t yieldsBefore = g_eeCheckpointYields;
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -1403,7 +1573,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (ctx->pc == entryPc)
+    if (ctx->pc == entryPc && g_eeCheckpointYields == yieldsBefore)
     {
         ctx->pc = fallthroughPc;
     }
@@ -2211,7 +2381,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    const bool due = m_eeScheduler->checkpointDue(cycles);
+    if (due)
+        ++g_eeCheckpointYields;
+    return due;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
@@ -2361,6 +2534,7 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    SetTextureFilter(frameTex, TEXTURE_FILTER_BILINEAR);
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -2420,6 +2594,48 @@ void PS2Runtime::run()
 
             }
         });
+        static const bool s_traceStatus = std::getenv("PS2X_TRACE_GS") != nullptr;
+        static uint64_t s_statusTick = 0;
+        if (s_traceStatus && (++s_statusTick % 120) == 0)
+        {
+            const auto eeSnapshot = m_eeScheduler->snapshot();
+            extern std::atomic<uint64_t> g_traceGsFinishWrites;
+            extern std::atomic<uint64_t> g_traceVif1DirectPackets;
+            extern std::atomic<uint64_t> g_traceVif1MpgCount;
+            extern std::atomic<uint64_t> g_traceVif1MpgTruncated;
+            extern std::atomic<uint32_t> g_traceVif1MpgMaxEnd;
+            extern std::atomic<uint32_t> g_traceVif1LastMscal;
+            extern uint64_t g_traceVuPairs;
+            extern uint64_t g_traceVuCycles;
+            std::cout << "[trace:vu1] pairs=" << g_traceVuPairs << " cycles=" << g_traceVuCycles << " mpg=" << g_traceVif1MpgCount.load()
+                      << " mpgTrunc=" << g_traceVif1MpgTruncated.load()
+                      << " mpgMaxEnd=0x" << std::hex << g_traceVif1MpgMaxEnd.load()
+                      << " lastMscal=0x" << g_traceVif1LastMscal.load() << std::dec << "\n";
+            std::cout << "[trace:ee] finish=" << g_traceGsFinishWrites.load()
+                      << " vif1direct=" << g_traceVif1DirectPackets.load()
+                      << " csr=0x" << std::hex << m_memory.gs().csr.load() << std::dec
+                      << " vif=" << m_memory.vifWriteCount()
+                      << " dctrl=0x" << std::hex << m_memory.readIORegister(0x1000E000u)
+                      << " dstat=0x" << m_memory.readIORegister(0x1000E010u)
+                      << " vif1chcr=0x" << m_memory.readIORegister(0x10009000u)
+                      << " vif1tadr=0x" << m_memory.readIORegister(0x10009030u)
+                      << " gifchcr=0x" << m_memory.readIORegister(0x1000A000u) << std::dec << "\n";
+            std::cout << "[trace:ee] host=" << s_statusTick
+                      << " vsync=" << m_eeScheduler->currentVSyncTick()
+                      << " pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
+                      << " ra=0x" << m_debugRa.load(std::memory_order_relaxed) << std::dec
+                      << " threads=" << eeSnapshot.threads.size()
+                      << " running=" << eeSnapshot.runningThreadId;
+            for (const auto &thread : eeSnapshot.threads)
+            {
+                std::cout << " [t" << thread.id << " st=" << static_cast<int>(thread.status)
+                          << " w=" << static_cast<int>(thread.waitReason) << ":" << thread.waitId
+                          << " pri=" << thread.currentPriority
+                          << " pc=0x" << std::hex << thread.pc << " ra=0x" << thread.ra << std::dec << "]";
+            }
+            std::cout << std::endl;
+        }
+
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -2430,9 +2646,16 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // The PS2 drives a 4:3 TV whatever the framebuffer resolution is, so
+        // letterbox/pillarbox the picture to 4:3 inside the window.
+        constexpr float kDisplayAspect = 4.0f / 3.0f;
+        float dstWidth = screenWidth;
+        float dstHeight = screenWidth / kDisplayAspect;
+        if (dstHeight > screenHeight)
+        {
+            dstHeight = screenHeight;
+            dstWidth = screenHeight * kDisplayAspect;
+        }
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
@@ -2445,6 +2668,7 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+        m_padBackend.updateGamepads();
 
         if (WindowShouldClose())
         {

@@ -338,6 +338,10 @@ public:
     bool registerFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
+    // Fallback for guest code with no recompiled function, such as code the game generates in RAM
+    // (src/lib/ps2_ee_interpreter.cpp). Has the RecompiledFunction signature.
+    static void interpretGuestCode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    bool canInterpretGuestCode(uint32_t address) const;
     bool dispatchGuestBranch(uint8_t *rdram,
                              R5900Context *ctx,
                              uint32_t targetPc,

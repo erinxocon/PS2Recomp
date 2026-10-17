@@ -50,6 +50,26 @@ namespace
         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
     }
 
+    // Guest cycle accounting is approximate (a fixed cost per backward branch), so expensive host work
+    // (GS rasterization, thread-switch unwinds) would otherwise slow emulated time. The guest clock is
+    // never allowed to fall behind wall-clock time; host-deadline pacing still caps it when running ahead.
+    std::chrono::steady_clock::time_point g_hostClockEpoch{};
+    uint64_t g_hostClockEpochCycle = 0;
+    uint32_t g_hostClockCheckCountdown = 0;
+    constexpr uint32_t kHostClockCheckInterval = 64u;
+    // PS2X_TURBO=1 drops host-time pacing: vblanks fire as soon as enough guest cycles have run.
+    const bool g_turboMode = std::getenv("PS2X_TURBO") != nullptr;
+
+    uint64_t hostElapsedEeCycles(std::chrono::steady_clock::time_point now)
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_hostClockEpoch).count();
+        if (elapsed <= 0)
+        {
+            return 0u;
+        }
+        return static_cast<uint64_t>((static_cast<__uint128_t>(elapsed) * EeScheduler::kEeClockHz) / 1000000000ull);
+    }
+
     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
@@ -146,8 +166,11 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
+    g_hostClockEpoch = std::chrono::steady_clock::now();
+    g_hostClockEpochCycle = m_eeCycle;
+    g_hostClockCheckCountdown = kHostClockCheckInterval;
     scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
+                  g_hostClockEpoch + kVBlankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
@@ -266,7 +289,7 @@ void EeScheduler::run()
             continue;
         }
 
-        if (!m_runtime.hasFunction(context.pc))
+        if (!m_runtime.hasFunction(context.pc) && !m_runtime.canInterpretGuestCode(context.pc))
         {
             if (!running->invocations.empty())
             {
@@ -357,6 +380,17 @@ void EeScheduler::postEvent(EeEvent event)
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
+
+    if (--g_hostClockCheckCountdown == 0u)
+    {
+        g_hostClockCheckCountdown = kHostClockCheckInterval;
+        const uint64_t hostCycle = g_hostClockEpochCycle + hostElapsedEeCycles(std::chrono::steady_clock::now());
+        if (hostCycle > m_eeCycle)
+        {
+            const uint64_t behind = hostCycle - m_eeCycle;
+            accountCycles(static_cast<uint32_t>(std::min<uint64_t>(behind, std::numeric_limits<uint32_t>::max())));
+        }
+    }
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
@@ -1798,7 +1832,7 @@ void EeScheduler::processDueDeadlines()
                 return;
             }
 
-            if (now < pacingDeadline)
+            if (!g_turboMode && now < pacingDeadline)
             {
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
@@ -1814,7 +1848,7 @@ void EeScheduler::processDueDeadlines()
             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
                                               [this, pacedNow](const ScheduledEvent &item)
                                               { return item.deadlineCycle <= m_eeCycle &&
-                                                       item.hostDeadline <= pacedNow; });
+                                                       (g_turboMode || item.hostDeadline <= pacedNow); });
             due.insert(due.end(),
                        std::make_move_iterator(m_deadlines.begin()),
                        std::make_move_iterator(firstFuture));
@@ -1867,6 +1901,11 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+        // Latch the picture that was scanned out during the field that is
+        // ending now (CSR.FIELD / vsyncTick still describe that field). The
+        // host window only consumes this latched frame, which keeps
+        // interlaced field parity in lockstep with the guest.
+        m_runtime.gs().latchHostPresentationFrame();
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
@@ -2036,6 +2075,10 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    if (g_turboMode)
+    {
+        hostDeadline = std::chrono::steady_clock::now();
+    }
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
