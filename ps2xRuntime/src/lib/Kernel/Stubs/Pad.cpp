@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/ee_scheduler.h"
 
 namespace ps2_stubs
 {
@@ -192,6 +193,90 @@ namespace ps2_stubs
             }
         }
 
+        // PS2X_INPUT_SCRIPT="start@600:10,cross@900" presses a button at a guest vsync tick for N frames
+        // (default 6). lleft/lright/lup/ldown push the left stick fully. Used for unattended testing; port 0 only.
+        struct ScriptedPress
+        {
+            uint16_t mask = 0;
+            int8_t stickX = 0;
+            int8_t stickY = 0;
+            uint64_t tick = 0;
+            uint64_t frames = 6;
+        };
+
+        const std::vector<ScriptedPress> &scriptedPresses()
+        {
+            static const std::vector<ScriptedPress> presses = []()
+            {
+                std::vector<ScriptedPress> result;
+                const char *script = std::getenv("PS2X_INPUT_SCRIPT");
+                if (!script)
+                {
+                    return result;
+                }
+                static const std::pair<const char *, uint16_t> kNames[] = {
+                    {"select", kPadBtnSelect}, {"l3", kPadBtnL3}, {"r3", kPadBtnR3}, {"start", kPadBtnStart},
+                    {"up", kPadBtnUp}, {"right", kPadBtnRight}, {"down", kPadBtnDown}, {"left", kPadBtnLeft},
+                    {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
+                    {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross},
+                    {"square", kPadBtnSquare}};
+                std::string text(script);
+                size_t start = 0;
+                while (start < text.size())
+                {
+                    size_t end = text.find(',', start);
+                    if (end == std::string::npos)
+                        end = text.size();
+                    const std::string item = text.substr(start, end - start);
+                    start = end + 1;
+                    const size_t at = item.find('@');
+                    if (at == std::string::npos)
+                        continue;
+                    ScriptedPress press;
+                    const std::string name = item.substr(0, at);
+                    for (const auto &[label, mask] : kNames)
+                    {
+                        if (name == label)
+                            press.mask = mask;
+                    }
+                    if (name == "lleft")
+                        press.stickX = -1;
+                    else if (name == "lright")
+                        press.stickX = 1;
+                    else if (name == "lup")
+                        press.stickY = -1;
+                    else if (name == "ldown")
+                        press.stickY = 1;
+                    press.tick = std::strtoull(item.c_str() + at + 1, nullptr, 10);
+                    const size_t colon = item.find(':', at);
+                    if (colon != std::string::npos)
+                        press.frames = std::strtoull(item.c_str() + colon + 1, nullptr, 10);
+                    if (press.mask != 0 || press.stickX != 0 || press.stickY != 0)
+                        result.push_back(press);
+                }
+                return result;
+            }();
+            return presses;
+        }
+
+        void applyScriptedState(PadInputState &state, PS2Runtime *runtime, int port)
+        {
+            if (port != 0 || runtime == nullptr)
+            {
+                return;
+            }
+            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+            for (const ScriptedPress &press : scriptedPresses())
+            {
+                const bool active = tick >= press.tick && tick < press.tick + press.frames;
+                setButton(state, press.mask, active);
+                if (active && press.stickX != 0)
+                    state.lx = press.stickX < 0 ? 0x00 : 0xFF;
+                if (active && press.stickY != 0)
+                    state.ly = press.stickY < 0 ? 0x00 : 0xFF;
+            }
+        }
+
         void resetPadStateLocked()
         {
             for (PadPortState &portState : g_padPorts)
@@ -313,9 +398,21 @@ namespace ps2_stubs
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
                 }
+                applyScriptedState(state, runtime, port);
             }
 
             fillPadStatus(outData, state, portState);
+            {
+                static const bool s_tracePad = std::getenv("PS2X_TRACE_PAD") != nullptr;
+                static uint16_t s_lastButtons[2] = {0xFFFFu, 0xFFFFu};
+                if (s_tracePad && port >= 0 && port < 2 && s_lastButtons[port] != state.buttons)
+                {
+                    s_lastButtons[port] = state.buttons;
+                    std::cout << "[pad] port=" << port << " slot=" << slot << " buttons=0x" << std::hex << state.buttons
+                              << " data2=0x" << int(outData[2]) << " data3=0x" << int(outData[3]) << std::dec
+                              << " tick=" << (runtime ? runtime->eeScheduler().currentVSyncTick() : 0) << std::endl;
+                }
+            }
 
             {
                 std::lock_guard<std::mutex> lock(g_padStateMutex);
