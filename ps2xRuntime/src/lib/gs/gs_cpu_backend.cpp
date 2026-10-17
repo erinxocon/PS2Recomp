@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
@@ -670,6 +671,9 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
     if (!m_vram)
         return 0u;
 
+    static const bool s_noTexCache = std::getenv("PS2X_NO_TEX_CACHE") != nullptr;
+    if (s_noTexCache)
+        return ReadVramUnlocked(psm, base, bw, x, y);
     return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
 }
 
@@ -1113,7 +1117,8 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         return 0xFFFF00FFu;
     };
 
-    if (!state.linearFilter)
+    static const bool s_pointSample = std::getenv("PS2X_POINT_SAMPLE") != nullptr;
+    if (!state.linearFilter || s_pointSample)
     {
         return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
     }
@@ -1325,7 +1330,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
                 continue;
 
-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            // Interpolate relative to v2 so constant-depth primitives keep their exact Z; the naive
+            // weighted sum rounds 2^24 to 2^24-1 on some pixels and breaks GEQUAL layering.
+            double z = v2.z + (v0.z - v2.z) * static_cast<double>(w0) + (v1.z - v2.z) * static_cast<double>(w1);
 
             uint8_t r, g, b, a;
             if (state.prim.iip)
@@ -1485,6 +1492,9 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
         return;
 
+    // Uploaded texels may already be cached from an earlier sample of the same pages.
+    m_texturePageCache.Invalidate();
+
     const uint32_t dbp = m_transfer.bitbltbuf.dbp;
     const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
     const uint8_t dpsm = m_transfer.bitbltbuf.dpsm;
@@ -1505,6 +1515,16 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
             return;
         }
 
+        if (count == 1u)
+        {
+            // Common case: step along the row without dividing.
+            if (++m_transferState.x >= dsax + rrw)
+            {
+                m_transferState.x = dsax;
+                ++m_transferState.y;
+            }
+            return;
+        }
         m_transferState.x = dsax + (m_transferState.copiedPixels % rrw);
         m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
     };
@@ -1864,6 +1884,20 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     const GSSmode2State smode2 = decodeSMode2(request.smode2);
     const bool fieldMode = smode2.interlaced && !smode2.frameMode;
     const bool oddField = (request.vsyncTick & 1ull) != 0ull;
+    {
+        // PS2X_TRACE_PRESENT=<tick> logs the display registers of 400 presented frames from that vsync tick.
+        static const char *s_tracePresentStart = std::getenv("PS2X_TRACE_PRESENT");
+        static uint32_t s_tracedPresents = 0u;
+        if (s_tracePresentStart && s_tracedPresents < 400u &&
+            request.vsyncTick >= std::strtoull(s_tracePresentStart, nullptr, 10))
+        {
+            ++s_tracedPresents;
+            std::cout << "[present] tick=" << request.vsyncTick << std::hex << " smode2=0x" << request.smode2
+                      << " pmode=0x" << request.pmode << " dispfb1=0x" << request.dispfb1 << " display1=0x"
+                      << request.display1 << " dispfb2=0x" << request.dispfb2 << " display2=0x" << request.display2
+                      << std::dec << std::endl;
+        }
+    }
     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
@@ -1956,7 +1990,9 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                     dst[3] = pmode.amod ? dst[3] : src[3];
                 }
             normalizePresentationAlpha(result.pixels, result.width, result.height);
-            if (fieldMode)
+            // Only a frame-height buffer holds both fields interleaved; 224-line field buffers are
+            // already a whole field and are line-doubled by the host presentation.
+            if (fieldMode && result.height > 256u)
                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);
             result.displayFbp = displayFrame1.fbp;
             result.sourceFbp = selected1.fbp;
@@ -1971,7 +2007,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     GSFrameReg selected = displayFrame;
     if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
         return {};
-    if (fieldMode)
+    if (fieldMode && result.height > 256u)
         applyFieldPresentation(result.pixels, result.width, result.height, oddField);
     normalizePresentationAlpha(result.pixels, result.width, result.height);
     result.displayFbp = displayFrame.fbp;

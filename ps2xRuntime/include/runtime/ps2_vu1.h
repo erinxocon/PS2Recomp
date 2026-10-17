@@ -207,6 +207,11 @@ private:
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
     uint64_t m_cachedCodeGeneration = 0;
+    // MAC/status flags are only computed while the loaded VU1 microcode contains an instruction that
+    // reads them (rescanned when the code generation changes).
+    bool m_flagsObservable = true;
+    uint64_t m_flagScanGeneration = ~0ull;
+    const uint8_t *m_flagScanCode = nullptr;
     bool m_decodedCodeCacheValid = false;
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
@@ -225,6 +230,14 @@ private:
     std::array<uint64_t, 4> m_accLatestWrite{};
 
     uint64_t m_cycle = 0;
+    // Earliest readyCycle among queued pipeline entries; commitReadyPipelines() is a no-op before it.
+    uint64_t m_nextCommitCycle = 0;
+    // Per-pipeline earliest readyCycle, so commitReadyPipelines() skips pipelines with nothing due.
+    uint64_t m_nextFlagCommit = 0;
+    uint64_t m_nextStoreCommit = 0;
+    uint64_t m_nextVfCommit = 0;
+    uint64_t m_nextViCommit = 0;
+    uint64_t m_nextAccCommit = 0;
     uint64_t m_nextWriteSequence = 0;
     uint64_t m_efuResourceReady = 0;
     uint32_t m_workingClip = 0;
@@ -250,8 +263,10 @@ private:
     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+    DecodedInstructionPair m_uncachedDecoded{};
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
+    void refreshFlagObservability(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory);
 
     void execUpper(uint32_t instr);
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
@@ -261,8 +276,8 @@ private:
     void applyFmacDest(float *dst, float *result, uint8_t dest);
     void applyFmacDestAcc(float *result, uint8_t dest);
     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
-    bool calculateFmacExactResult(uint32_t component, long double &result) const;
-    uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
+    bool calculateFmacExactResult(uint32_t component, double &result) const;
+    uint8_t normalizeFmacExactResult(float &value, double exactResult) const;
     uint32_t calculateFmacProductSticky(uint8_t dest) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);
