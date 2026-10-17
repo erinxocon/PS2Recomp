@@ -4,6 +4,9 @@
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
+    // A real drive keeps streaming the sectors that follow a file. Pseudo-LBN files get a zero-filled
+    // tail so streams can complete a final bank that extends past the end of the file.
+    constexpr uint32_t kCdStreamTailPadSectors = 64u;
     constexpr uint32_t kCdPseudoLbnStart = 0x00100000;
 
     struct CdFileEntry
@@ -392,7 +395,7 @@ namespace
         entry.baseLbn = g_nextPseudoLbn;
         entry.sectors = sectorsForBytes(sizeBytes);
 
-        g_nextPseudoLbn += entry.sectors + 1;
+        g_nextPseudoLbn += entry.sectors + 1 + kCdStreamTailPadSectors;
         g_cdFilesByKey.emplace(key, entry);
         entryOut = entry;
         g_lastCdError = 0;
@@ -445,6 +448,20 @@ namespace
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
             const uint64_t offset = relativeLbn * kCdSectorSize;
             return readHostRange(entry.hostPath, offset, dst, byteCount);
+        }
+
+        for (const auto &[key, entry] : g_cdFilesByKey)
+        {
+            const uint32_t endLbn = entry.baseLbn + entry.sectors;
+            if (lbn >= endLbn && lbn < endLbn + kCdStreamTailPadSectors)
+            {
+                if (dst)
+                {
+                    std::memset(dst, 0, byteCount);
+                }
+                g_lastCdError = 0;
+                return true;
+            }
         }
 
         const std::filesystem::path cdImage = getCdImagePath();
@@ -1219,7 +1236,7 @@ namespace
     constexpr uint32_t kMaxStubWarningsPerName = 8;
     std::unordered_map<std::string, uint32_t> g_stubWarningCount;
     std::mutex g_stubWarningMutex;
-    constexpr uint32_t kMaxPrintfLogs = 200;
+    constexpr uint32_t kMaxPrintfLogs = 100000;
     constexpr size_t kMaxFormattedOutputBytes = 4096;
     uint32_t g_printfLogCount = 0;
     std::mutex g_printfLogMutex;
