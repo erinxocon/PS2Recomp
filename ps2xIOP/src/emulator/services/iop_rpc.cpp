@@ -3,6 +3,7 @@
 #include "../core/iop_cpu.h"
 #include "../core/iop_kernel.h"
 #include "../core/iop_memory.h"
+#include "../iop_emulator_const.h"
 #include "ps2x/iop/iop_host.h"
 
 #include <algorithm>
@@ -292,12 +293,13 @@ namespace ps2x::iop::detail
             }
         }
 
-        uint32_t returnPointer = executor.executeGuestFunction(server.function,
-                                                               request.function,
-                                                               server.buffer,
-                                                               request.send.size,
-                                                               0u,
-                                                               server.gp);
+        uint32_t returnPointer = executor.executeGuestFunctionWithBudget(server.function,
+                                                                         request.function,
+                                                                         server.buffer,
+                                                                         request.send.size,
+                                                                         0u,
+                                                                         server.gp,
+                                                                         kMaxRpcCallInstructions);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
