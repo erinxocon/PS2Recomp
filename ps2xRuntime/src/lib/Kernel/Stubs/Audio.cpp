@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Audio.h"
+#include "../../ps2_iop_transport.h"
 
 namespace ps2_stubs
 {
@@ -54,6 +55,98 @@ namespace ps2_stubs
             g_audio_stub_state = {};
         }
 
+        // libsdr (EE) <-> SDRDRV (IOP) remote sound RPC. When the SDRDRV IRX runs on the
+        // emulated IOP, sceSdRemote is forwarded exactly like the SDK client does it:
+        // sceSifCallRpc(&cd, command, 0, sbuf[16], 64, rbuf, 16, 0, 0) with
+        // sbuf = {command, args...}, returning rbuf[0].
+        constexpr uint32_t kSdrRemoteSid = 0x80000701u;
+        constexpr uint32_t kSdrClientOffset = 0x00u;
+        constexpr uint32_t kSdrSendOffset = 0x40u;
+        constexpr uint32_t kSdrRecvOffset = 0x80u;
+        constexpr uint32_t kSdrBlockSize = 0xC0u;
+        uint32_t g_sdrRemoteBlock = 0u;
+        bool g_sdrRemoteBound = false;
+
+        bool sdrRemoteAvailable(PS2Runtime *runtime)
+        {
+            return runtime && PS2IopTransport::canBindRpc(runtime, kSdrRemoteSid);
+        }
+
+        bool sdrRemoteEnsureBound(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (g_sdrRemoteBound)
+                return true;
+            if (!sdrRemoteAvailable(runtime))
+                return false;
+            if (g_sdrRemoteBlock == 0u)
+            {
+                g_sdrRemoteBlock = runtime->guestMalloc(kSdrBlockSize, 64u);
+                if (g_sdrRemoteBlock == 0u)
+                    return false;
+            }
+            uint8_t *block = getMemPtr(rdram, g_sdrRemoteBlock);
+            if (!block)
+                return false;
+            std::memset(block, 0, kSdrBlockSize);
+
+            const R5900Context saved = *ctx;
+            setReturnU32(ctx, 0u);
+            SET_GPR_U32(ctx, 4, g_sdrRemoteBlock + kSdrClientOffset);
+            SET_GPR_U32(ctx, 5, kSdrRemoteSid);
+            SET_GPR_U32(ctx, 6, 0u);
+            ps2_syscalls::SifBindRpc(rdram, ctx, runtime);
+            *ctx = saved;
+
+            uint32_t server = 0u;
+            std::memcpy(&server, block + kSdrClientOffset + 36u /* t_SifRpcClientData::server */, sizeof(server));
+            g_sdrRemoteBound = server != 0u;
+            return g_sdrRemoteBound;
+        }
+
+        bool sdrRemoteCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                           uint32_t command, const uint32_t (&args)[6], uint32_t &result)
+        {
+            if (!sdrRemoteEnsureBound(rdram, ctx, runtime))
+                return false;
+            uint8_t *block = getMemPtr(rdram, g_sdrRemoteBlock);
+            if (!block)
+                return false;
+            uint32_t send[16]{};
+            send[0] = command;
+            for (size_t i = 0; i < 6u; ++i)
+                send[i + 1u] = args[i];
+            std::memcpy(block + kSdrSendOffset, send, sizeof(send));
+            std::memset(block + kSdrRecvOffset, 0, 16u);
+
+            const R5900Context saved = *ctx;
+            // Give SifCallRpc a private frame so its stack-argument probing
+            // (end_param at 0(sp)) reads zeros rather than caller data.
+            const uint32_t frame = (getRegU32(ctx, 29) - 0x80u) & ~0xFu;
+            uint8_t *framePtr = getMemPtr(rdram, frame);
+            uint8_t savedFrame[0x40]{};
+            if (framePtr)
+            {
+                std::memcpy(savedFrame, framePtr, sizeof(savedFrame));
+                std::memset(framePtr, 0, sizeof(savedFrame));
+            }
+            SET_GPR_U32(ctx, 29, frame);
+            SET_GPR_U32(ctx, 4, g_sdrRemoteBlock + kSdrClientOffset);
+            SET_GPR_U32(ctx, 5, command);
+            SET_GPR_U32(ctx, 6, 0u);
+            SET_GPR_U32(ctx, 7, g_sdrRemoteBlock + kSdrSendOffset);
+            SET_GPR_U32(ctx, 8, 64u);
+            SET_GPR_U32(ctx, 9, g_sdrRemoteBlock + kSdrRecvOffset);
+            SET_GPR_U32(ctx, 10, 16u);
+            SET_GPR_U32(ctx, 11, 0u);
+            ps2_syscalls::SifCallRpc(rdram, ctx, runtime);
+            *ctx = saved;
+            if (framePtr)
+                std::memcpy(framePtr, savedFrame, sizeof(savedFrame));
+
+            std::memcpy(&result, block + kSdrRecvOffset, sizeof(result));
+            return true;
+        }
+
         uint32_t currentBlockStatus(const BlockTransferState &transfer)
         {
             const uint32_t position = (transfer.base + transfer.offset) & kAudioPositionMask;
@@ -76,11 +169,22 @@ namespace ps2_stubs
 
     void sceSdRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)runtime;
-
         const uint32_t cmd = getRegU32(ctx, 5);
         const uint32_t cmdArg0 = getRegU32(ctx, 6);
         const uint32_t cmdArg1 = getRegU32(ctx, 7);
+
+        {
+            // EE n32 varargs: sceSdRemote(arg, command, a2, a3, t0, t1, t2, t3).
+            const uint32_t args[6] = {
+                cmdArg0, cmdArg1, getRegU32(ctx, 8), getRegU32(ctx, 9), getRegU32(ctx, 10), getRegU32(ctx, 11)};
+            uint32_t remoteResult = 0u;
+            if (sdrRemoteCall(rdram, ctx, runtime, cmd, args, remoteResult))
+            {
+                setReturnU32(ctx, remoteResult);
+                return;
+            }
+        }
+
         const uint32_t sp = getRegU32(ctx, 29);
         const uint32_t arg4Reg = getRegU32(ctx, 8);
         const uint32_t arg5Reg = getRegU32(ctx, 9);
@@ -202,6 +306,8 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
         resetAudioStubStateUnlocked();
         g_audio_stub_state.initialized = true;
+        g_sdrRemoteBound = false;
+        (void)sdrRemoteEnsureBound(rdram, ctx, runtime);
         setReturnS32(ctx, 0);
     }
 

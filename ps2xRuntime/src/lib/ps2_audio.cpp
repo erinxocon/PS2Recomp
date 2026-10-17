@@ -1,6 +1,9 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include "ps2x/iop/iop_audio.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -63,6 +66,196 @@ namespace
     }
 }
 
+namespace
+{
+    // Host side of the emulated SPU2 (ps2xIOP): frames arrive from the IOP
+    // thread in emulated time and are buffered for a raylib callback stream.
+    // PS2X_AUDIO_DUMP=<file.wav> additionally records the exact SPU2 output.
+    class Spu2HostOutput
+    {
+    public:
+        static Spu2HostOutput &instance()
+        {
+            static Spu2HostOutput output;
+            return output;
+        }
+
+        static void sink(void *user, const int16_t *frames, size_t frameCount)
+        {
+            (void)user;
+            instance().push(frames, frameCount);
+        }
+
+        void push(const int16_t *frames, size_t frameCount)
+        {
+            writeDump(frames, frameCount);
+            ensureStream();
+            if (!m_streamReady)
+                return;
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (size_t i = 0; i < frameCount * 2u; ++i)
+            {
+                m_ring[m_write] = frames[i];
+                m_write = (m_write + 1u) % m_ring.size();
+                if (m_write == m_read)
+                    m_read = (m_read + 2u) % m_ring.size(); // overrun: drop oldest frame
+            }
+            // Keep latency bounded if emulation runs ahead of the host clock.
+            const size_t maxFill = kSampleRate / 4u * 2u;
+            const size_t fill = (m_write + m_ring.size() - m_read) % m_ring.size();
+            if (fill > maxFill)
+                m_read = (m_write + m_ring.size() - kSampleRate / 10u * 2u) % m_ring.size();
+        }
+
+        void shutdown()
+        {
+            std::lock_guard<std::mutex> lock(m_dumpMutex);
+            finalizeDump();
+        }
+
+    private:
+        static constexpr size_t kSampleRate = ps2x::iop::kSpu2SampleRate;
+
+        Spu2HostOutput()
+            : m_ring(kSampleRate * 2u)
+        {
+            const char *dumpPath = std::getenv("PS2X_AUDIO_DUMP");
+            if (dumpPath && *dumpPath)
+            {
+                m_dump = std::fopen(dumpPath, "wb");
+                if (m_dump)
+                    writeWavHeader();
+            }
+        }
+
+        static void streamCallback(void *buffer, unsigned int frames)
+        {
+            instance().pull(static_cast<int16_t *>(buffer), frames);
+        }
+
+        void pull(int16_t *out, unsigned int frames)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const size_t want = static_cast<size_t>(frames) * 2u;
+            size_t fill = (m_write + m_ring.size() - m_read) % m_ring.size();
+            if (m_priming)
+            {
+                // After an underrun wait for ~40 ms of audio before resuming.
+                if (fill < kSampleRate / 25u * 2u)
+                {
+                    std::memset(out, 0, want * sizeof(int16_t));
+                    return;
+                }
+                m_priming = false;
+            }
+            size_t i = 0;
+            for (; i < want && fill != 0u; ++i, --fill)
+            {
+                out[i] = m_ring[m_read];
+                m_read = (m_read + 1u) % m_ring.size();
+            }
+            if (i < want)
+            {
+                std::memset(out + i, 0, (want - i) * sizeof(int16_t));
+                m_priming = true;
+            }
+        }
+
+        void ensureStream()
+        {
+#if defined(PLATFORM_VITA)
+            return;
+#else
+            if (m_streamTried || !IsAudioDeviceReady())
+                return;
+            m_streamTried = true;
+            SetAudioStreamBufferSizeDefault(1024);
+            m_stream = LoadAudioStream(static_cast<unsigned int>(kSampleRate), 16u, 2u);
+            if (!IsAudioStreamValid(m_stream))
+                return;
+            SetAudioStreamCallback(m_stream, &Spu2HostOutput::streamCallback);
+            PlayAudioStream(m_stream);
+            m_streamReady = true;
+#endif
+        }
+
+        void writeDump(const int16_t *frames, size_t frameCount)
+        {
+            if (!m_dump)
+                return;
+            std::lock_guard<std::mutex> lock(m_dumpMutex);
+            if (!m_dump)
+                return;
+            std::fwrite(frames, sizeof(int16_t) * 2u, frameCount, m_dump);
+            m_dumpFrames += static_cast<uint32_t>(frameCount);
+            if (m_dumpFrames - m_dumpFramesAtHeader >= kSampleRate / 2u)
+            {
+                writeWavHeader();
+                m_dumpFramesAtHeader = m_dumpFrames;
+            }
+        }
+
+        void writeWavHeader()
+        {
+            const uint32_t dataBytes = m_dumpFrames * 4u;
+            uint8_t header[44];
+            const auto put32 = [&](size_t offset, uint32_t value)
+            {
+                for (int i = 0; i < 4; ++i)
+                    header[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+            };
+            const auto put16 = [&](size_t offset, uint16_t value)
+            {
+                header[offset] = static_cast<uint8_t>(value);
+                header[offset + 1] = static_cast<uint8_t>(value >> 8);
+            };
+            std::memcpy(header, "RIFF", 4);
+            put32(4, 36u + dataBytes);
+            std::memcpy(header + 8, "WAVEfmt ", 8);
+            put32(16, 16u);
+            put16(20, 1u);
+            put16(22, 2u);
+            put32(24, static_cast<uint32_t>(kSampleRate));
+            put32(28, static_cast<uint32_t>(kSampleRate) * 4u);
+            put16(32, 4u);
+            put16(34, 16u);
+            std::memcpy(header + 36, "data", 4);
+            put32(40, dataBytes);
+            const long position = std::ftell(m_dump);
+            std::fseek(m_dump, 0, SEEK_SET);
+            std::fwrite(header, 1, sizeof(header), m_dump);
+            if (position > static_cast<long>(sizeof(header)))
+                std::fseek(m_dump, position, SEEK_SET);
+            std::fflush(m_dump);
+        }
+
+        void finalizeDump()
+        {
+            if (!m_dump)
+                return;
+            writeWavHeader();
+            std::fclose(m_dump);
+            m_dump = nullptr;
+        }
+
+        std::mutex m_mutex;
+        std::vector<int16_t> m_ring;
+        size_t m_read = 0;
+        size_t m_write = 0;
+        bool m_priming = true;
+        bool m_streamTried = false;
+        bool m_streamReady = false;
+#if !defined(PLATFORM_VITA)
+        AudioStream m_stream{};
+#endif
+        std::mutex m_dumpMutex;
+        std::FILE *m_dump = nullptr;
+        uint32_t m_dumpFrames = 0;
+        uint32_t m_dumpFramesAtHeader = 0;
+    };
+}
+
 namespace ps2_vag
 {
     bool decode(const uint8_t *data, uint32_t sizeBytes,
@@ -81,10 +274,14 @@ struct PS2AudioBackend::Impl
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
 {
+    (void)Spu2HostOutput::instance();
+    ps2x::iop::setAudioSink(&Spu2HostOutput::sink, nullptr);
 }
 
 PS2AudioBackend::~PS2AudioBackend()
 {
+    ps2x::iop::setAudioSink(nullptr, nullptr);
+    Spu2HostOutput::instance().shutdown();
     if (m_impl)
         stopAll();
 }
