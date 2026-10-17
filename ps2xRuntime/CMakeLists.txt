@@ -437,12 +437,26 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
-file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
-)
+set(PS2X_GENERATED_DIR "" CACHE PATH "Directory holding recompiler output (cpp + ps2_recompiled_*.h); defaults to src/runner")
+set(PS2X_GAME_SOURCE_DIR "" CACHE PATH "Directory of hand-written game-specific sources (overrides) linked into the runner")
+
+if(PS2X_GENERATED_DIR)
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+        "${PS2X_GENERATED_DIR}/*.cpp"
+    )
+else()
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+    )
+endif()
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+
+if(PS2X_GAME_SOURCE_DIR)
+    file(GLOB PS2X_GAME_SOURCES CONFIGURE_DEPENDS "${PS2X_GAME_SOURCE_DIR}/*.cpp")
+    list(APPEND RUNNER_SRC_FILES ${PS2X_GAME_SOURCES})
+endif()
 
 if(EXISTS "${RUNNER_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${RUNNER_MAIN_CPP}")
@@ -476,6 +490,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
+        "${PS2X_GENERATED_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_GENERATED_DIR}/ps2_recompiled_stubs.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
@@ -511,6 +527,10 @@ target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+
+if(PS2X_GENERATED_DIR)
+    target_include_directories(ps2EntryRunner PRIVATE "${PS2X_GENERATED_DIR}")
+endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
