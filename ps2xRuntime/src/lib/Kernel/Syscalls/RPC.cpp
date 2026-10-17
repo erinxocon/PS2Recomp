@@ -1,3 +1,7 @@
+#include <iostream>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
 #include "Common.h"
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
@@ -18,6 +22,19 @@ namespace ps2_syscalls
 
         void pushSifRpcDebugEventLocked(SifRpcDebugEvent event)
         {
+            static const bool s_traceRpc = std::getenv("PS2X_TRACE_RPC") != nullptr;
+            if (s_traceRpc)
+            {
+                std::ostringstream line;
+                line << "[rpc] " << (event.op ? event.op : "") << std::hex << " sid=0x" << event.sid << " fno=0x" << event.rpcNum
+                     << " flags=0x" << event.flags << " mode=" << event.mode << " send=";
+                for (uint32_t i = 0; i < event.sendPreviewSize && i < 16u; ++i)
+                    line << (i ? " " : "") << std::setw(2) << std::setfill('0') << int(event.sendPreview[i]);
+                line << " recv=";
+                for (uint32_t i = 0; i < event.recvPreviewSize && i < 16u; ++i)
+                    line << (i ? " " : "") << std::setw(2) << std::setfill('0') << int(event.recvPreview[i]);
+                std::cout << line.str() << std::dec << std::endl;
+            }
             event.seq = ++g_sif_rpc_debug_next_seq;
             g_sif_rpc_debug_history[event.seq % kSifRpcDebugHistoryCount] = event;
         }
