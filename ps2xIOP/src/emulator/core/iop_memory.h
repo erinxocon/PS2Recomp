@@ -1,6 +1,9 @@
 #pragma once
 
+#include "iop_spu2.h"
+
 #include <cstddef>
+#include <memory>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -22,7 +25,9 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // Modules load below HeapBase. 0x80000 leaves room for typical module sets while giving drivers that
+        // size buffers from free memory (e.g. 192KB stream buffers) what a real 2MB IOP would offer.
+        static constexpr uint32_t HeapBase = 0x00080000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
@@ -72,12 +77,15 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
+        [[nodiscard]] IopSpu2 &spu2() const noexcept { return *m_spu2; }
+
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
 
         std::vector<uint8_t> m_ram;
+        std::unique_ptr<IopSpu2> m_spu2;
         std::vector<uint8_t> m_owned;
         std::vector<uint8_t> m_scratch;
         std::unordered_map<uint32_t, uint32_t> m_hardware;
