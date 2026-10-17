@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
@@ -9,6 +10,10 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+
+// Tags of the most recent VIF1 DMA chain (diagnostics, printed by the VIF1 interpreter on desync).
+struct Vif1ChainTagRecord { uint32_t addr; uint64_t lo; uint64_t hi; uint32_t streamOffset; };
+std::vector<Vif1ChainTagRecord> g_lastVif1Chain;
 
 namespace
 {
@@ -887,7 +892,15 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
+            {
                 markVU1CodeModified();
+                static int s_vu1CodeWriteLogs = 0;
+                if (s_vu1CodeWriteLogs < 32 && std::getenv("PS2X_TRACE_VU1"))
+                {
+                    ++s_vu1CodeWriteLogs;
+                    std::cerr << "[vu1:ee-write] phys=0x" << std::hex << physAddr << " offset=0x" << vuOffset << std::dec << std::endl;
+                }
+            }
             return;
         }
     }
@@ -930,7 +943,15 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
+            {
                 markVU1CodeModified();
+                static int s_vu1CodeWriteLogs = 0;
+                if (s_vu1CodeWriteLogs < 32 && std::getenv("PS2X_TRACE_VU1"))
+                {
+                    ++s_vu1CodeWriteLogs;
+                    std::cerr << "[vu1:ee-write] phys=0x" << std::hex << physAddr << " offset=0x" << vuOffset << std::dec << std::endl;
+                }
+            }
             return;
         }
     }
@@ -994,7 +1015,15 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
+            {
                 markVU1CodeModified();
+                static int s_vu1CodeWriteLogs = 0;
+                if (s_vu1CodeWriteLogs < 32 && std::getenv("PS2X_TRACE_VU1"))
+                {
+                    ++s_vu1CodeWriteLogs;
+                    std::cerr << "[vu1:ee-write] phys=0x" << std::hex << physAddr << " offset=0x" << vuOffset << std::dec << std::endl;
+                }
+            }
             return;
         }
     }
@@ -1049,7 +1078,15 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
+            {
                 markVU1CodeModified();
+                static int s_vu1CodeWriteLogs = 0;
+                if (s_vu1CodeWriteLogs < 32 && std::getenv("PS2X_TRACE_VU1"))
+                {
+                    ++s_vu1CodeWriteLogs;
+                    std::cerr << "[vu1:ee-write] phys=0x" << std::hex << physAddr << " offset=0x" << vuOffset << std::dec << std::endl;
+                }
+            }
             return;
         }
     }
@@ -1107,7 +1144,15 @@ void PS2Memory::write128(uint32_t address, __m128i value)
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
+            {
                 markVU1CodeModified();
+                static int s_vu1CodeWriteLogs = 0;
+                if (s_vu1CodeWriteLogs < 32 && std::getenv("PS2X_TRACE_VU1"))
+                {
+                    ++s_vu1CodeWriteLogs;
+                    std::cerr << "[vu1:ee-write] phys=0x" << std::hex << physAddr << " offset=0x" << vuOffset << std::dec << std::endl;
+                }
+            }
             return;
         }
     }
@@ -1435,6 +1480,32 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         const uint8_t *tp = tagBase + physTag;
                         uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "dma chain tag", tagAddr);
+                        {
+                            // PS2X_TRACE_DMACHAIN: dump the VIF1 chain the first few times a marker tag appears.
+                            static const bool s_traceChain = std::getenv("PS2X_TRACE_DMACHAIN") != nullptr;
+                            static int s_chainDumps = 0;
+                            const uint64_t tagHi = loadScalar<uint64_t>(tp, 8, 16, "dma chain tag hi", tagAddr);
+                            if (s_traceChain && s_chainDumps < 2 && tagHi == 0x1234567812345678ull && channelBase == 0x10009000u)
+                            {
+                                ++s_chainDumps;
+                                std::cout << "[dmachain] marker tag at 0x" << std::hex << currentTagAddr
+                                          << " start tadr=0x" << m_ioRegisters[channelBase + 0x30] << " tags so far=" << std::dec << tagsProcessed << std::endl;
+                                uint32_t walk = m_ioRegisters[channelBase + 0x30];
+                                for (int i = 0; i < 64 && walk; ++i)
+                                {
+                                    const uint8_t *wp = m_rdram + (walk & 0x1FFFFF0u);
+                                    const uint64_t wlo = loadScalar<uint64_t>(wp, 0, 16, "dbg", walk);
+                                    const uint64_t whi = loadScalar<uint64_t>(wp, 8, 16, "dbg", walk);
+                                    const uint32_t wid = (wlo >> 28) & 7u, wq = wlo & 0xFFFFu, wa = (wlo >> 32) & 0x7FFFFFFFu;
+                                    std::cout << "  tag@0x" << std::hex << walk << " id=" << wid << " qwc=0x" << wq << " addr=0x" << wa
+                                              << " hi=0x" << whi << std::dec << std::endl;
+                                    if (wid == 1) walk = walk + 16 + wq * 16;
+                                    else if (wid == 2) walk = wa;
+                                    else if (wid == 3 || wid == 4) walk += 16;
+                                    else break;
+                                }
+                            }
+                        }
                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
@@ -1442,6 +1513,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
 
+                        if (channelBase == 0x10009000u)
+                        {
+                            if (tagsProcessed == 1)
+                                g_lastVif1Chain.clear();
+                            if (g_lastVif1Chain.size() < 512u)
+                                g_lastVif1Chain.push_back({currentTagAddr, tag, loadScalar<uint64_t>(tp, 8, 16, "dbg tag hi", tagAddr),
+                                                           static_cast<uint32_t>(chainBuf.size())});
+                        }
                         uint32_t dataAddr = 0;
                         bool hasPayload = (tagQwc > 0);
                         bool endChain = false;

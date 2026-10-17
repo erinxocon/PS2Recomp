@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <iostream>
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include <cstring>
@@ -283,6 +285,26 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
+// Diagnostic counter read by the PS2X_TRACE_GS status line.
+std::atomic<uint64_t> g_traceVif1DirectPackets{0};
+
+struct Vif1ChainTagRecord { uint32_t addr; uint64_t lo; uint64_t hi; uint32_t streamOffset; };
+extern std::vector<Vif1ChainTagRecord> g_lastVif1Chain;
+
+// Recent VIFcodes (diagnostics for PS2X_TRACE_VIF).
+struct Vif1CmdHistoryEntry { uint32_t cmd; uint32_t pos; uint32_t size; };
+static Vif1CmdHistoryEntry g_vif1CmdHistory[64] = {};
+static uint32_t g_vif1CmdHistoryPos = 0u;
+
+// Quadwords of a DIRECT payload that did not fit in the previous VIF1 buffer; the next buffer
+// starts with that raw payload (not with VIFcodes).
+static uint32_t g_vif1DirectRemainQw = 0u;
+static bool g_vif1DirectRemainHl = false;
+std::atomic<uint64_t> g_traceVif1MpgCount{0};
+std::atomic<uint64_t> g_traceVif1MpgTruncated{0};
+std::atomic<uint32_t> g_traceVif1MpgMaxEnd{0};
+std::atomic<uint32_t> g_traceVif1LastMscal{0};
+
 void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
@@ -297,6 +319,52 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
+    // A DIRECT payload first continues a GIF IMAGE transfer left open by an earlier packet (the GIF
+    // keeps its tag state across DIRECT commands); the rest is parsed as ordinary GIF packets.
+    auto submitDirectPayload = [this](const uint8_t *payload, uint32_t qwCount, bool directHl)
+    {
+        if (m_vif1PendingPath2ImageQwc != 0u)
+        {
+            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, qwCount);
+            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+            const uint64_t imageTag =
+                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+                (static_cast<uint64_t>(kGifFmtImage) << 58);
+            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+            std::memcpy(imagePacket.data() + 16u, payload, static_cast<size_t>(chunkQw) * 16u);
+            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+            m_vif1PendingPath2ImageQwc -= chunkQw;
+            if (m_vif1PendingPath2ImageQwc == 0u)
+            {
+                m_vif1PendingPath2DirectHl = false;
+            }
+            payload += chunkQw * 16u;
+            qwCount -= chunkQw;
+        }
+    
+        if (qwCount == 0u)
+        {
+            return;
+        }
+    
+        submitGifPacket(GifPathId::Path2, payload, qwCount * 16u, true, directHl);
+        const uint32_t pendingImageQw = pendingGifImageQwc(payload, qwCount * 16u);
+        if (pendingImageQw != 0u)
+        {
+            m_vif1PendingPath2ImageQwc = pendingImageQw;
+            m_vif1PendingPath2DirectHl = directHl;
+            static const bool s_traceVif = std::getenv("PS2X_TRACE_VIF") != nullptr;
+            if (s_traceVif)
+            {
+                uint64_t tagLo = 0;
+                std::memcpy(&tagLo, payload, sizeof(tagLo));
+                std::cout << "[vif1] pending IMAGE qwc=" << pendingImageQw << " directQw=" << qwCount
+                          << std::hex << " firstTag=0x" << tagLo << std::dec << std::endl;
+            }
+        }
+    };
+
     if (sizeBytes == 0u)
         return;
 
@@ -304,35 +372,54 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        if (g_vif1DirectRemainQw != 0u)
         {
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
             {
                 break;
             }
-
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-
+            const uint32_t chunkQw = std::min<uint32_t>(g_vif1DirectRemainQw, availableQw);
+            submitDirectPayload(data + pos, chunkQw, g_vif1DirectRemainHl);
             pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
+            g_vif1DirectRemainQw -= chunkQw;
             continue;
         }
 
         uint32_t cmd;
         memcpy(&cmd, data + pos, 4);
+        g_vif1CmdHistory[g_vif1CmdHistoryPos++ % 64u] = {cmd, pos, sizeBytes};
+        {
+            static const bool s_traceVifBad = std::getenv("PS2X_TRACE_VIF") != nullptr;
+            const uint8_t op = (cmd >> 24) & 0x7Fu;
+            const bool valid = op <= 0x07u || op == 0x10u || op == 0x11u || op == 0x13u || op == 0x14u || op == 0x15u ||
+                               op == 0x17u || op == 0x20u || op == 0x30u || op == 0x31u || op == 0x4Au || op == 0x50u ||
+                               op == 0x51u || op >= 0x60u;
+            static int s_badReports = 0;
+            if (s_traceVifBad && !valid && cmd != 0x12345678u && s_badReports < 3)
+            {
+                ++s_badReports;
+                std::cout << "[vif1] invalid VIFcode 0x" << std::hex << cmd << " at 0x" << pos << " size=0x" << sizeBytes << " history:";
+                for (uint32_t i = 0; i < 64u; ++i)
+                {
+                    const auto &h = g_vif1CmdHistory[(g_vif1CmdHistoryPos + i) % 64u];
+                    std::cout << " " << h.cmd << "@" << h.pos;
+                }
+                std::cout << std::dec << std::endl;
+                std::cout << "[vif1] bytes:";
+                for (uint32_t b = (pos >= 0x100u ? pos - 0x100u : 0u) & ~15u; b + 16u <= sizeBytes && b < pos + 0x40u; b += 16u)
+                {
+                    uint32_t w[4];
+                    std::memcpy(w, data + b, 16);
+                    std::cout << std::hex << "\n   " << b << ": " << w[0] << " " << w[1] << " " << w[2] << " " << w[3];
+                }
+                std::cout << std::dec << std::endl;
+                std::cout << "[vif1] last chain tags:";
+                for (const auto &t : g_lastVif1Chain)
+                    std::cout << std::hex << " {@" << t.addr << " lo=" << t.lo << " hi=" << t.hi << " off=" << t.streamOffset << "}";
+                std::cout << std::dec << std::endl;
+            }
+        }
         pos += 4;
 
         uint8_t opcode = (cmd >> 24) & 0x7F;
@@ -416,6 +503,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            g_traceVif1LastMscal.store(startPC, std::memory_order_relaxed);
+            {
+                static const bool s_traceVu1 = std::getenv("PS2X_TRACE_VU1") != nullptr;
+                static uint32_t s_lastTraced = 0xFFFFFFFFu;
+                if (s_traceVu1 && startPC != s_lastTraced)
+                {
+                    s_lastTraced = startPC;
+                    std::cout << "[vu1:mscal] pc=0x" << std::hex << startPC << std::dec << std::endl;
+                }
+            }
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, runTop, runItop);
             continue;
@@ -474,10 +571,24 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 uint32_t copyBytes = mpgBytes;
                 if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
+                g_traceVif1MpgCount.fetch_add(1, std::memory_order_relaxed);
+                static const bool s_traceVu1 = std::getenv("PS2X_TRACE_VU1") != nullptr;
+                if (s_traceVu1)
+                {
+                    std::cout << "[vu1:mpg] dest=0x" << std::hex << destAddr << " bytes=0x" << copyBytes
+                              << " first=0x" << *reinterpret_cast<const uint32_t *>(data + pos)
+                              << std::dec << " fits=" << (pos + copyBytes <= sizeBytes) << std::endl;
+                }
+                if (destAddr + copyBytes > g_traceVif1MpgMaxEnd.load(std::memory_order_relaxed))
+                    g_traceVif1MpgMaxEnd.store(destAddr + copyBytes, std::memory_order_relaxed);
                 if (pos + copyBytes <= sizeBytes)
                 {
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     markVU1CodeModified();
+                }
+                else
+                {
+                    g_traceVif1MpgTruncated.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             pos += mpgBytes;
@@ -495,22 +606,34 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > availableQw)
                 qwCount = availableQw;
 
+            const bool directHl = (opcode == VIF_DIRECTHL);
             if (qwCount > 0)
             {
-                const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
-
-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
-                if (pendingImageQw != 0u)
-                {
-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
-                    m_vif1PendingPath2DirectHl = directHl;
-                }
+                g_traceVif1DirectPackets.fetch_add(1, std::memory_order_relaxed);
+                submitDirectPayload(data + pos, qwCount, directHl);
             }
 
             pos += qwCount * 16;
             if (truncated)
             {
+                g_vif1DirectRemainQw = (imm == 0 ? 65536u : imm) - qwCount;
+                g_vif1DirectRemainHl = directHl;
+                // A DIRECT 0 (65536 qw) or a huge remainder only appears after the parser has lost sync
+                // with the stream; carrying it would swallow every later packet (and the frame's FINISH).
+                if (imm == 0u || g_vif1DirectRemainQw > 1024u)
+                    g_vif1DirectRemainQw = 0u;
+                static const bool s_traceVif = std::getenv("PS2X_TRACE_VIF") != nullptr;
+                if (s_traceVif)
+                {
+                    std::cout << "[vif1] DIRECT truncated: imm=" << imm << " got=" << qwCount
+                              << " remain=" << g_vif1DirectRemainQw << " bufSize=" << sizeBytes << " history:";
+                    for (uint32_t i = 48; i < 64u; ++i)
+                    {
+                        const auto &h = g_vif1CmdHistory[(g_vif1CmdHistoryPos + i) % 64u];
+                        std::cout << std::hex << " " << h.cmd << "@" << h.pos << std::dec;
+                    }
+                    std::cout << std::endl;
+                }
                 pos = sizeBytes;
                 break;
             }
