@@ -512,6 +512,19 @@ namespace ps2_stubs
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
+            // Audio PES payloads waiting for the game's stream callback. libmpeg stops demuxing when a
+            // callback returns 0 (its audio buffer is full) and re-delivers the packet later; callbacks run
+            // asynchronously here, so packets are queued and delivered one at a time until accepted.
+            struct PendingAudioPacket
+            {
+                uint32_t streamType = 0u;
+                std::vector<uint8_t> bytes;
+                uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
+                uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
+                MpegRegisteredCallback callback;
+            };
+            std::deque<PendingAudioPacket> pendingAudio;
+            bool audioDeliveryInflight = false;
         };
 
         struct MpegStreamCallbackEvent
@@ -561,6 +574,11 @@ namespace ps2_stubs
         constexpr uint8_t kMpegPrivateStream1 = 0xBDu;
         constexpr size_t kStartCodeNotFound = std::numeric_limits<size_t>::max();
         constexpr uint32_t kMpegCallbackDataSize = 0x20u;
+        constexpr size_t kMaxPendingAudioPackets = 8u;
+        // Scratch for re-delivered audio payloads. It lies below the game image (0x100000) so the game's
+        // ring-wrap logic (data < ring end) copies it contiguously; the runtime only uses RAM below 0x80000.
+        constexpr uint32_t kAudioRedeliveryScratch = 0x000F0000u;
+        constexpr uint32_t kAudioRedeliveryScratchSize = 0x00010000u;
 
         uint64_t mpegPictureIntervalQ32(uint8_t frameRateCode, uint8_t frameRateExtensionN = 0u, uint8_t frameRateExtensionD = 0u)
         {
@@ -1345,22 +1363,19 @@ namespace ps2_stubs
                     const size_t payloadStart = pes.payloadOffset;
                     if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
                     {
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents,
-                            pes.pts90k,
-                            pes.dts90k);
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrADPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents,
-                            pes.pts90k,
-                            pes.dts90k);
+                        for (const uint32_t streamType : {kMpegStrPCM, kMpegStrADPCM})
+                        {
+                            for (const MpegRegisteredCallback &callback : matchingStreamCallbacks(mpegAddr, streamType))
+                            {
+                                MpegPlaybackState::PendingAudioPacket packet;
+                                packet.streamType = streamType;
+                                packet.bytes.assign(buffer.data() + payloadStart, buffer.data() + packetEnd);
+                                packet.pts = pes.pts90k >= 0 ? static_cast<uint64_t>(pes.pts90k) : 0xFFFFFFFFFFFFFFFFull;
+                                packet.dts = pes.dts90k >= 0 ? static_cast<uint64_t>(pes.dts90k) : 0xFFFFFFFFFFFFFFFFull;
+                                packet.callback = callback;
+                                playback.pendingAudio.push_back(std::move(packet));
+                            }
+                        }
                     }
                 }
 
@@ -1409,6 +1424,9 @@ namespace ps2_stubs
             // lets the game's producer loop wake the consumer again. Backpressure
             // still propagates naturally to sceCdStRead because the ring does not
             // advance while this is true.
+            // Audio the game has not accepted yet: stop reading the ring, as libmpeg would.
+            if (playback.pendingAudio.size() >= kMaxPendingAudioPackets)
+                return true;
             return !g_mpeg_stub_state.currentCdStreamEofSeen &&
                    playback.decodedFrames.size() >= kMaxDecodedPicturesAhead;
         }
@@ -1637,6 +1655,81 @@ namespace ps2_stubs
                     dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
                 }
             }
+        }
+
+        void pumpPendingAudio(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t mpegAddr)
+        {
+            if (!rdram || !ctx || !runtime)
+                return;
+            MpegPlaybackState::PendingAudioPacket packet;
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                static const bool s_traceAudio = std::getenv("PS2X_TRACE_MPEG_AUDIO") != nullptr;
+                static uint32_t s_pumpTraces = 0u;
+                if (s_traceAudio && s_pumpTraces++ < 40u)
+                    std::cout << "[mpeg-audio] pump inflight=" << playback.audioDeliveryInflight << " pending=" << playback.pendingAudio.size() << std::endl;
+                if (playback.audioDeliveryInflight || playback.pendingAudio.empty())
+                    return;
+                playback.audioDeliveryInflight = true;
+                packet = playback.pendingAudio.front();
+            }
+            const MpegRegisteredCallback &callback = packet.callback;
+            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+            uint8_t *scratch = getMemPtr(rdram, kAudioRedeliveryScratch);
+            if (cbDataAddr == 0u || !scratch || packet.bytes.size() > kAudioRedeliveryScratchSize ||
+                callback.func == 0u || !runtime->hasFunction(callback.func))
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                playback.audioDeliveryInflight = false;
+                if (!playback.pendingAudio.empty())
+                    playback.pendingAudio.pop_front();
+                if (cbDataAddr != 0u)
+                    runtime->guestFree(cbDataAddr);
+                return;
+            }
+            std::memcpy(scratch, packet.bytes.data(), packet.bytes.size());
+            MpegStreamCallbackEvent event{};
+            event.mpegAddr = mpegAddr;
+            event.streamType = packet.streamType;
+            event.dataAddr = kAudioRedeliveryScratch;
+            event.len = static_cast<uint32_t>(packet.bytes.size());
+            event.pts = packet.pts;
+            event.dts = packet.dts;
+            writeMpegCallbackData(rdram, cbDataAddr, event);
+
+            R5900Context callbackCtx = *ctx;
+            SET_GPR_U32(&callbackCtx, 4, mpegAddr);
+            SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
+            SET_GPR_U32(&callbackCtx, 6, callback.data);
+            SET_GPR_U32(&callbackCtx, 7, 0u);
+            SET_GPR_U32(&callbackCtx, 29, 0u);
+            SET_GPR_U32(&callbackCtx, 31, 0u);
+            callbackCtx.pc = callback.func;
+
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::RpcCallback;
+            invocation.context = callbackCtx;
+            invocation.onComplete = [rdram, runtime, cbDataAddr, mpegAddr](const R5900Context &done, R5900Context &base)
+            {
+                runtime->guestFree(cbDataAddr);
+                const bool accepted = GPR_U32((&done), 2) != 0u;
+                static const bool s_traceAudio = std::getenv("PS2X_TRACE_MPEG_AUDIO") != nullptr;
+                static uint32_t s_audioTraces = 0u;
+                if (s_traceAudio && s_audioTraces++ < 40u)
+                    std::cout << "[mpeg-audio] callback returned " << GPR_U32((&done), 2) << " pc=0x" << std::hex << done.pc << std::dec << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                    MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                    playback.audioDeliveryInflight = false;
+                    if (accepted && !playback.pendingAudio.empty())
+                        playback.pendingAudio.pop_front();
+                }
+                if (accepted)
+                    pumpPendingAudio(rdram, &base, runtime, mpegAddr);
+            };
+            runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
 
         void dispatchStreamCallbacksUnlocked(uint8_t *rdram,
@@ -2106,6 +2199,7 @@ namespace ps2_stubs
 
         if (backpressured)
         {
+            pumpPendingAudio(rdram, ctx, runtime, mpegAddr);
             if (traceIdx < 32u)
             {
                 PS2_IF_AGRESSIVE_LOGS({
@@ -2142,6 +2236,7 @@ namespace ps2_stubs
         }
 
         dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+        pumpPendingAudio(rdram, ctx, runtime, mpegAddr);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
     }
 
@@ -2197,6 +2292,7 @@ namespace ps2_stubs
 
         if (backpressured)
         {
+            pumpPendingAudio(rdram, ctx, runtime, mpegAddr);
             if (traceIdx < 32u)
             {
                 PS2_IF_AGRESSIVE_LOGS({
@@ -2236,6 +2332,7 @@ namespace ps2_stubs
         }
 
         dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+        pumpPendingAudio(rdram, ctx, runtime, mpegAddr);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
     }
 
