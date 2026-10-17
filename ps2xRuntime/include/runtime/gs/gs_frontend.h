@@ -2,6 +2,7 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -138,6 +139,19 @@ public:
                                           bool *outUsedPreferred = nullptr) const;
     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
     bool clearActiveFramebuffer(uint32_t rgba);
+    // Cheap always-on counters for diagnosing missing output (see PS2X_TRACE_GS).
+    struct TraceCounters
+    {
+        std::atomic<uint64_t> gifPackets{0};
+        std::atomic<uint64_t> transfers{0};
+        std::atomic<uint64_t> imageBytes{0};
+        std::atomic<uint64_t> draws{0};
+        std::atomic<uint32_t> lastDrawFbp{0};
+        std::atomic<uint32_t> lastDrawPrim{0};
+        std::atomic<uint32_t> lastTransferDbp{0};
+    };
+    TraceCounters &traceCounters() { return m_traceCounters; }
+
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
     uint64_t nativePackedGIFPacketCount() const { return m_nativePackedGIFPacketCount; }
 
@@ -149,6 +163,7 @@ public:
     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
 
 private:
+    TraceCounters m_traceCounters;
     void snapshotVRAM();
     void writeRegisterUnlocked(uint8_t regAddr, uint64_t value);
     void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);

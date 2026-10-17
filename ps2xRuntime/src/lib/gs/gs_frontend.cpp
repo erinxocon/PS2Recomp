@@ -3,6 +3,7 @@
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -10,9 +11,182 @@
 #include <iostream>
 #include <sstream>
 
+#include "gs_threaded_backend.h"
+
+namespace
+{
+    // The CPU rasterizer, split across PS2X_GS_THREADS worker threads (0 = run it inline).
+    std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend()
+    {
+        const uint32_t workers = GSThreadedBackend::ConfiguredWorkers();
+        if (workers == 0u)
+            return std::make_unique<GSCpuBackend>();
+        return std::make_unique<GSThreadedBackend>([]() { return std::make_unique<GSCpuBackend>(); }, workers);
+    }
+}
+
+// Diagnostic counter read by the PS2X_TRACE_GS status line.
+std::atomic<uint64_t> g_traceGsFinishWrites{0};
+
+namespace
+{
+    // PS2X_TRACE_DRAWS_TICK=<vsync> logs every primitive submitted during that vsync tick.
+    void traceDrawIfRequested(const GSPrimitiveBatch &batch, uint64_t tick)
+    {
+        static const long s_traceTick = []()
+        {
+            const char *value = std::getenv("PS2X_TRACE_DRAWS_TICK");
+            return value ? std::strtol(value, nullptr, 0) : -1L;
+        }();
+        if (s_traceTick < 0 || tick != static_cast<uint64_t>(s_traceTick))
+            return;
+        const GSDrawState &st = batch.state;
+        const GSContext &c = st.context;
+        std::ostringstream line;
+        line << "[draw] prim=" << static_cast<int>(st.prim.type) << " tme=" << st.prim.tme << " abe=" << st.prim.abe
+             << " fst=" << st.prim.fst << " ctxt=" << st.prim.ctxt << " iip=" << st.prim.iip
+             << " fbp=" << c.frame.fbp << " fbw=" << int(c.frame.fbw) << " fpsm=" << int(c.frame.psm)
+             << std::hex << " fbmsk=0x" << c.frame.fbmsk << " clamp=0x" << c.clamp << " tex1=0x" << c.tex1 << " alpha=0x" << c.alpha << " test=0x" << c.test << std::dec
+             << " zbuf(zbp=" << c.zbuf.zbp << " psm=" << int(c.zbuf.psm) << " zmsk=" << int(c.zbuf.zmask) << ")" << " tex0(tbp=" << c.tex0.tbp0 << " tbw=" << int(c.tex0.tbw) << " psm=" << int(c.tex0.psm) << " cpsm=" << int(c.tex0.cpsm) << " csm=" << int(c.tex0.csm) << " tw=" << int(c.tex0.tw)
+             << " th=" << int(c.tex0.th) << " tcc=" << int(c.tex0.tcc) << " tfx=" << int(c.tex0.tfx) << " cbp=" << c.tex0.cbp << " cld=" << int(c.tex0.cld) << ")";
+        for (int i = 0; i < batch.vertexCount; ++i)
+        {
+            const GSVertex &v = batch.vertices[static_cast<size_t>(i)];
+            line << " v" << i << "=(" << v.x << "," << v.y << " z=" << static_cast<uint64_t>(v.z) << " rgba=" << int(v.r) << "," << int(v.g) << "," << int(v.b)
+                 << "," << int(v.a) << " st=" << v.s << "," << v.t << " q=" << v.q << " uv=" << v.u << "," << v.v << ")";
+        }
+        std::cout << line.str() << std::endl;
+    }
+}
+
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
+
+    // Rebuilds full-height frames from games that render each interlaced field into its own
+    // half-height buffer (each offset by half a line) and flip buffers every field. Showing such
+    // fields line-doubled makes the picture bob up and down by a line; a TV interleaves them.
+    // The two most recent distinct field buffers are woven together, in whichever line order
+    // combs less, and pixels of the older field that still comb (motion) are interpolated from the
+    // newer field. PS2X_DEINTERLACE=0 disables it.
+    class FieldWeaver
+    {
+    public:
+        // Returns true and replaces `pixels` (RGBA, `width` wide, `height` field lines) with a
+        // 2*height woven frame when a matching previous field is available.
+        bool Weave(std::vector<uint8_t> &pixels, uint32_t width, uint32_t &height, uint32_t fbp, uint64_t tick)
+        {
+            static const bool s_enabled = []()
+            {
+                const char *value = std::getenv("PS2X_DEINTERLACE");
+                return !(value && value[0] == '0');
+            }();
+            const size_t fieldBytes = static_cast<size_t>(width) * height * 4u;
+            if (!s_enabled || width == 0u || height == 0u || height > 256u || pixels.size() < fieldBytes)
+            {
+                m_hasCurrent = m_hasPrevious = false;
+                return false;
+            }
+
+            const bool sameShape = m_width == width && m_height == height;
+            if (!sameShape || !m_hasCurrent || fbp != m_currentFbp)
+            {
+                // A new field buffer is being displayed: it becomes the current field.
+                if (sameShape && m_hasCurrent)
+                {
+                    m_previous.swap(m_current);
+                    m_hasPrevious = true;
+                }
+                else
+                {
+                    m_hasPrevious = false;
+                }
+                m_current.assign(pixels.begin(), pixels.begin() + static_cast<std::ptrdiff_t>(fieldBytes));
+                m_currentFbp = fbp;
+                m_currentTick = tick;
+                m_width = width;
+                m_height = height;
+                m_hasCurrent = true;
+                if (m_hasPrevious)
+                    m_currentOnEvenLines = CombEnergy(m_current, m_previous) <= CombEnergy(m_previous, m_current);
+            }
+            else
+            {
+                // Same buffer still displayed; it may have been redrawn since.
+                std::memcpy(m_current.data(), pixels.data(), fieldBytes);
+            }
+
+            // A buffer held for long (the game stopped flipping) is not a field pair any more.
+            if (!m_hasPrevious || tick - m_currentTick > 8u)
+                return false;
+
+            const std::vector<uint8_t> &top = m_currentOnEvenLines ? m_current : m_previous;
+            const std::vector<uint8_t> &bottom = m_currentOnEvenLines ? m_previous : m_current;
+            const size_t rowBytes = static_cast<size_t>(width) * 4u;
+            std::vector<uint8_t> out(rowBytes * height * 2u);
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                std::memcpy(out.data() + (2u * y) * rowBytes, top.data() + y * rowBytes, rowBytes);
+                std::memcpy(out.data() + (2u * y + 1u) * rowBytes, bottom.data() + y * rowBytes, rowBytes);
+            }
+            // Repair combing on the older field's lines: if a pixel lies well outside the range of
+            // its vertical neighbours from the newer field, take their average.
+            const uint32_t olderParity = m_currentOnEvenLines ? 1u : 0u;
+            constexpr int kTolerance = 24;
+            for (uint32_t y = olderParity; y < 2u * height; y += 2u)
+            {
+                const uint8_t *above = out.data() + (y > 0u ? y - 1u : y + 1u) * rowBytes;
+                const uint8_t *below = out.data() + (y + 1u < 2u * height ? y + 1u : y - 1u) * rowBytes;
+                uint8_t *line = out.data() + y * rowBytes;
+                for (uint32_t x = 0; x < width * 4u; x += 4u)
+                {
+                    bool combed = false;
+                    for (uint32_t c = 0; c < 3u && !combed; ++c)
+                    {
+                        const int lo = std::min(above[x + c], below[x + c]) - kTolerance;
+                        const int hi = std::max(above[x + c], below[x + c]) + kTolerance;
+                        combed = line[x + c] < lo || line[x + c] > hi;
+                    }
+                    if (combed)
+                    {
+                        for (uint32_t c = 0; c < 4u; ++c)
+                            line[x + c] = static_cast<uint8_t>((above[x + c] + below[x + c] + 1) / 2);
+                    }
+                }
+            }
+            pixels.swap(out);
+            height *= 2u;
+            return true;
+        }
+
+    private:
+        // Vertical high-frequency energy of `top` woven over `bottom`, sampled on the green channel.
+        uint64_t CombEnergy(const std::vector<uint8_t> &top, const std::vector<uint8_t> &bottom) const
+        {
+            const size_t rowBytes = static_cast<size_t>(m_width) * 4u;
+            uint64_t energy = 0u;
+            for (uint32_t y = 1; y + 1u < m_height; y += 2u)
+            {
+                // Woven order: top[y], bottom[y], top[y+1]; measure bottom[y] against its neighbours.
+                const uint8_t *a = top.data() + y * rowBytes;
+                const uint8_t *b = bottom.data() + y * rowBytes;
+                const uint8_t *c = top.data() + (y + 1u) * rowBytes;
+                for (uint32_t x = 1; x < m_width * 4u; x += 16u)
+                    energy += static_cast<uint64_t>(std::abs(2 * b[x] - a[x] - c[x]));
+            }
+            return energy;
+        }
+
+        std::vector<uint8_t> m_current;
+        std::vector<uint8_t> m_previous;
+        uint32_t m_width = 0u;
+        uint32_t m_height = 0u;
+        uint32_t m_currentFbp = 0u;
+        uint64_t m_currentTick = 0u;
+        bool m_hasCurrent = false;
+        bool m_hasPrevious = false;
+        bool m_currentOnEvenLines = true;
+    };
 
     GSPrimReg decodePrimRegister(uint64_t value)
     {
@@ -106,7 +280,7 @@ namespace
 
 
 GS::GS()
-    : m_backend(std::make_unique<GSCpuBackend>())
+    : m_backend(makeDefaultRasterBackend())
 {
     reset();
 }
@@ -117,7 +291,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
     if (!m_backend)
-        m_backend = std::make_unique<GSCpuBackend>();
+        m_backend = makeDefaultRasterBackend();
     m_backend->Initialize(vram, vramSize);
     reset();
 }
@@ -540,6 +714,61 @@ void GS::latchHostPresentationFrame()
         request = buildPresentationRequestUnlocked();
     }
 
+    // Weaves the fields and publishes the frame for the host window; runs on whichever thread built
+    // the frame (a GS worker when presenting asynchronously).
+    static FieldWeaver s_fieldWeaver;
+    static bool s_debugEventPending = false;
+    auto publish = [this](PresentationFrame &&frame, uint64_t vsyncTick)
+    {
+        const bool hasFrame = static_cast<bool>(frame);
+        uint32_t height = frame.height;
+        if (hasFrame)
+            s_fieldWeaver.Weave(frame.pixels, frame.width, height, frame.displayFbp, vsyncTick);
+        std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+        m_hostPresentationFrame = std::move(frame.pixels);
+        m_hostPresentationWidth = frame.width;
+        m_hostPresentationHeight = height;
+        m_hostPresentationDisplayFbp = frame.displayFbp;
+        m_hostPresentationSourceFbp = frame.sourceFbp;
+        m_hostPresentationUsedPreferred = frame.usedPreferred;
+        m_hasHostPresentationFrame = hasFrame;
+        s_debugEventPending = hasFrame;
+    };
+    // The debug history is kept under m_stateMutex, which a GS worker must not take (the guest
+    // thread holds it while waiting for the workers), so the last published frame is recorded here.
+    auto recordPublishedFrame = [this]()
+    {
+        uint32_t displayFbp, sourceFbp, width, height;
+        bool usedPreferred;
+        {
+            std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+            if (!s_debugEventPending)
+                return;
+            s_debugEventPending = false;
+            displayFbp = m_hostPresentationDisplayFbp;
+            sourceFbp = m_hostPresentationSourceFbp;
+            width = m_hostPresentationWidth;
+            height = m_hostPresentationHeight;
+            usedPreferred = m_hostPresentationUsedPreferred;
+        }
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
+    };
+
+    {
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        if (auto *threaded = dynamic_cast<GSThreadedBackend *>(m_backend.get()))
+        {
+            // The frame is built behind the queued draws while the guest keeps running; if the
+            // previous one is still pending, the host keeps showing the last frame.
+            const uint64_t vsyncTick = request.vsyncTick;
+            threaded->PresentAsync(request, [publish, vsyncTick](PresentationFrame &&frame) mutable
+                                   { publish(std::move(frame), vsyncTick); });
+            recordPublishedFrame();
+            return;
+        }
+    }
+
     PresentationFrame frame{};
     {
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
@@ -550,29 +779,8 @@ void GS::latchHostPresentationFrame()
             frame = m_backend->Present(request);
         }
     }
-
-    const bool hasFrame = static_cast<bool>(frame);
-    const uint32_t displayFbp = frame.displayFbp;
-    const uint32_t sourceFbp = frame.sourceFbp;
-    const uint32_t width = frame.width;
-    const uint32_t height = frame.height;
-    const bool usedPreferred = frame.usedPreferred;
-    {
-        std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
-        m_hostPresentationFrame = std::move(frame.pixels);
-        m_hostPresentationWidth = width;
-        m_hostPresentationHeight = height;
-        m_hostPresentationDisplayFbp = displayFbp;
-        m_hostPresentationSourceFbp = sourceFbp;
-        m_hostPresentationUsedPreferred = usedPreferred;
-        m_hasHostPresentationFrame = hasFrame;
-    }
-
-    if (hasFrame)
-    {
-        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-        recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
-    }
+    publish(std::move(frame), request.vsyncTick);
+    recordPublishedFrame();
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
@@ -644,6 +852,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
+    m_traceCounters.gifPackets.fetch_add(1, std::memory_order_relaxed);
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
 
@@ -725,7 +934,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             if ((nloop * nreg) & 1)
                 offset += 8;
         }
-        else if (flg == GIF_FMT_IMAGE)
+        else // GIF_FMT_IMAGE; FLG=3 also behaves as IMAGE on hardware
         {
             uint32_t imageBytes = nloop * 16;
             if (offset + imageBytes > sizeBytes)
@@ -1391,6 +1600,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             command.trxpos = m_trxpos;
             command.trxreg = m_trxreg;
             command.direction = m_trxdir;
+            m_traceCounters.transfers.fetch_add(1, std::memory_order_relaxed);
+            static const bool s_traceTrx = std::getenv("PS2X_TRACE_TRX") != nullptr;
+            if (s_traceTrx)
+            {
+                std::cout << "[trx] dir=" << m_trxdir << " dbp=0x" << std::hex << m_bitbltbuf.dbp << std::dec
+                          << " dbw=" << int(m_bitbltbuf.dbw) << " dpsm=" << int(m_bitbltbuf.dpsm)
+                          << " sbp=0x" << std::hex << m_bitbltbuf.sbp << std::dec
+                          << " pos=(" << m_trxpos.dsax << "," << m_trxpos.dsay << ") size=" << m_trxreg.rrw << "x" << m_trxreg.rrh
+                          << std::endl;
+            }
+            m_traceCounters.lastTransferDbp.store(static_cast<uint32_t>(m_bitbltbuf.dbp), std::memory_order_relaxed);
             m_backend->BeginTransfer(command);
         }
         recordTransferDebugEventUnlocked();
@@ -1476,6 +1696,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_FINISH:
     {
+        g_traceGsFinishWrites.fetch_add(1, std::memory_order_relaxed);
         if (m_backend)
         {
             m_backend->Flush();
@@ -1576,6 +1797,10 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
+        m_traceCounters.draws.fetch_add(1, std::memory_order_relaxed);
+        traceDrawIfRequested(batch, m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_relaxed) : 0u);
+        m_traceCounters.lastDrawFbp.store(batch.state.context.frame.fbp, std::memory_order_relaxed);
+        m_traceCounters.lastDrawPrim.store(static_cast<uint32_t>(m_prim.type), std::memory_order_relaxed);
         m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
@@ -1609,6 +1834,7 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    m_traceCounters.imageBytes.fetch_add(sizeBytes, std::memory_order_relaxed);
     if (m_backend)
         m_backend->UploadImage(data, sizeBytes);
 }
@@ -1635,7 +1861,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 {
     if (!backend)
-        backend = std::make_unique<GSCpuBackend>();
+        backend = makeDefaultRasterBackend();
 
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
