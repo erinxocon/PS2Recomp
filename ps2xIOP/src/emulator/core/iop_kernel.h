@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 
 namespace ps2x::iop::detail
@@ -61,6 +62,18 @@ namespace ps2x::iop::detail
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+        // Code running in a nested synchronous call (no current thread) that would block instead asks
+        // the emulator to run the other IOP threads until `ready(currentCycle)` holds (bounded).
+        using NestedWaitFn = std::function<void(const std::function<bool(uint64_t)> &ready)>;
+        void setNestedWaitHandler(NestedWaitFn handler) { m_nestedWait = std::move(handler); }
+
+        // Nested synchronous guest calls (RPC servers, callbacks) run outside any IOP thread.
+        IopThread *exchangeCurrentThread(IopThread *thread) noexcept
+        {
+            IopThread *previous = m_currentThread;
+            m_currentThread = thread;
+            return previous;
+        }
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
         void cleanupDeadThreads();
@@ -99,5 +112,6 @@ namespace ps2x::iop::detail
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
         IopThread *m_currentThread = nullptr;
+        NestedWaitFn m_nestedWait;
     };
 }
