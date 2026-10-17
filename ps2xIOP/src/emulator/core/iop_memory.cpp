@@ -1,3 +1,6 @@
+#include <cstdlib>
+#include <cstdio>
+#include <vector>
 #include "iop_memory.h"
 
 #include <algorithm>
@@ -20,7 +23,7 @@ namespace ps2x::iop::detail
     }
 
     IopMemory::IopMemory()
-        : m_ram(RamSize), m_owned(RamSize), m_scratch(ScratchSize)
+        : m_ram(RamSize), m_spu2(std::make_unique<IopSpu2>(m_ram)), m_owned(RamSize), m_scratch(ScratchSize)
     {
         reset();
     }
@@ -37,6 +40,7 @@ namespace ps2x::iop::detail
         m_interruptMask = 0;
         m_interruptControl = 1;
         m_dmaStart.reset();
+        m_spu2->reset();
     }
 
     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
@@ -51,6 +55,8 @@ namespace ps2x::iop::detail
             return m_ram[phys];
         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
             return m_scratch[phys - ScratchBase];
+        if (IopSpu2::isRegister(phys))
+            return static_cast<uint8_t>(m_spu2->read16(phys & ~1u) >> ((phys & 1u) * 8u));
         const uint32_t value = readHardware32(phys & ~3u);
         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
     }
@@ -64,6 +70,10 @@ namespace ps2x::iop::detail
             std::memcpy(&value, m_ram.data() + phys, sizeof(value));
             return value;
         }
+        if ((phys & 1u) == 0u && IopSpu2::isRegister(phys))
+            return m_spu2->read16(phys);
+        if ((phys & 1u) == 0u && IopSpu2::isDmaRegister(phys))
+            return static_cast<uint16_t>(m_spu2->readDma32(phys & ~3u) >> ((phys & 2u) * 8u));
         return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
     }
 
@@ -82,6 +92,11 @@ namespace ps2x::iop::detail
             std::memcpy(&value, m_scratch.data() + (phys - ScratchBase), sizeof(value));
             return value;
         }
+        if ((phys & 3u) == 0u && IopSpu2::isRegister(phys))
+            return static_cast<uint32_t>(m_spu2->read16(phys)) |
+                   (static_cast<uint32_t>(m_spu2->read16(phys + 2u)) << 16u);
+        if ((phys & 3u) == 0u && IopSpu2::isDmaRegister(phys))
+            return m_spu2->readDma32(phys);
         if ((phys & 3u) == 0u && isHardwareAddress(phys))
             return readHardware32(phys);
 
@@ -105,6 +120,22 @@ namespace ps2x::iop::detail
             m_scratch[phys - ScratchBase] = value;
             return;
         }
+        if (IopSpu2::isRegister(phys))
+        {
+            const uint32_t shift = (phys & 1u) * 8u;
+            uint16_t current = m_spu2->read16(phys & ~1u);
+            current = static_cast<uint16_t>((current & ~(0xFFu << shift)) | (static_cast<uint32_t>(value) << shift));
+            m_spu2->write16(phys & ~1u, current);
+            return;
+        }
+        if (IopSpu2::isDmaRegister(phys))
+        {
+            const uint32_t shift = (phys & 3u) * 8u;
+            uint32_t current = m_spu2->readDma32(phys & ~3u);
+            current = (current & ~(0xFFu << shift)) | (static_cast<uint32_t>(value) << shift);
+            m_spu2->writeDma32(phys & ~3u, current);
+            return;
+        }
         const uint32_t aligned = phys & ~3u;
         uint32_t current = readHardware32(aligned);
         const uint32_t shift = (phys & 3u) * 8u;
@@ -119,6 +150,19 @@ namespace ps2x::iop::detail
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
             markOwned(phys, sizeof(value));
+            return;
+        }
+        if ((phys & 1u) == 0u && IopSpu2::isRegister(phys))
+        {
+            m_spu2->write16(phys, value);
+            return;
+        }
+        if ((phys & 1u) == 0u && IopSpu2::isDmaRegister(phys))
+        {
+            const uint32_t shift = (phys & 2u) * 8u;
+            uint32_t current = m_spu2->readDma32(phys & ~3u);
+            current = (current & ~(0xFFFFu << shift)) | (static_cast<uint32_t>(value) << shift);
+            m_spu2->writeDma32(phys & ~3u, current);
             return;
         }
         write8(address, static_cast<uint8_t>(value));
@@ -137,6 +181,17 @@ namespace ps2x::iop::detail
         if ((phys & 3u) == 0u && phys >= ScratchBase && phys + 3u < ScratchBase + ScratchSize)
         {
             std::memcpy(m_scratch.data() + (phys - ScratchBase), &value, sizeof(value));
+            return;
+        }
+        if ((phys & 3u) == 0u && IopSpu2::isRegister(phys))
+        {
+            m_spu2->write16(phys, static_cast<uint16_t>(value));
+            m_spu2->write16(phys + 2u, static_cast<uint16_t>(value >> 16u));
+            return;
+        }
+        if ((phys & 3u) == 0u && IopSpu2::isDmaRegister(phys))
+        {
+            m_spu2->writeDma32(phys, value);
             return;
         }
         if ((phys & 3u) == 0u)
@@ -299,7 +354,9 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        // First fit from the bottom of the heap so freed blocks are reused (a bump cursor leaks every
+        // free and starves modules such as MSTREAM that size their buffers from free memory).
+        uint32_t candidate = alignUp(HeapBase, alignment);
         for (;;)
         {
             bool overlap = false;
@@ -315,8 +372,15 @@ namespace ps2x::iop::detail
             if (!overlap)
                 break;
         }
+        static const bool s_traceAlloc = std::getenv("PS2X_TRACE_IOPMEM") != nullptr;
         if (candidate > HeapLimit || size > HeapLimit - candidate)
+        {
+            if (s_traceAlloc)
+                std::fprintf(stderr, "[iopmem] alloc 0x%x FAILED\n", size);
             return 0u;
+        }
+        if (s_traceAlloc)
+            std::fprintf(stderr, "[iopmem] alloc 0x%x -> 0x%x\n", size, candidate);
         m_allocations.push_back({candidate, size});
         markOwned(candidate, size);
         m_heapCursor = std::max(m_heapCursor, candidate + size);
@@ -339,7 +403,23 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        std::vector<Allocation> blocks;
+        for (const auto &block : m_allocations)
+            if (block.address + block.size > HeapBase && block.address < HeapLimit)
+                blocks.push_back(block);
+        std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b)
+                  { return a.address < b.address; });
+        uint32_t largest = 0u;
+        uint32_t cursor = HeapBase;
+        for (const auto &block : blocks)
+        {
+            if (block.address > cursor)
+                largest = std::max(largest, block.address - cursor);
+            cursor = std::max(cursor, block.address + block.size);
+        }
+        if (HeapLimit > cursor)
+            largest = std::max(largest, HeapLimit - cursor);
+        return largest;
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const
