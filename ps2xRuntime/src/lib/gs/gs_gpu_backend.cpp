@@ -148,6 +148,7 @@ uniform float uAref;
 uniform int uFba;
 uniform int uBlendC;            // 0 As, 1 Ad (unsupported, treated as As), 2 FIX
 uniform float uBlendFix;
+uniform int uAlphaPass;         // 0: all pixels; 1: f <= 1 only; 2: f > 1 only, as Cs*f - Cd*(f-1)
 uniform float uSrcScale;        // multiplier for the source colour (|cs| of the blend), < 0 = use alpha factor
 uniform int uSrcScaleMode;      // 0: 1, 1: f, 2: 1 - f, 3: 1 + f
 layout(location = 0, index = 0) out vec4 oColor;
@@ -276,8 +277,12 @@ void main()
     float f = (uBlendC == 2 ? uBlendFix : alpha) / 128.0;
     float s = uSrcScaleMode == 0 ? 1.0 : uSrcScaleMode == 1 ? f : uSrcScaleMode == 2 ? 1.0 - f : 1.0 + f;
     if (uFba != 0 && c.a < 128.0) alpha = c.a + 128.0;
+    // (Cs - Cd) * f + Cd with f > 1 (alpha above 128) needs a negative destination factor, which GL
+    // clamps away: such draws run twice, this half as Cs*f - Cd*(f-1) with a subtracting blend.
+    if ((uAlphaPass == 1 && f > 1.0) || (uAlphaPass == 2 && f <= 1.0))
+        discard;
     oColor = vec4(c.rgb * s / 255.0, alpha / 255.0);
-    oBlend = vec4(clamp(f, 0.0, 1.0));
+    oBlend = vec4(uAlphaPass == 2 ? f - 1.0 : clamp(f, 0.0, 1.0));
     gl_FragDepth = vDepthConst > 0.5 ? vDepthFlat : vDepth;
 }
 )";
@@ -450,6 +455,7 @@ private:
         uint32_t tbp, tbw, texPsm, texa;
         uint32_t palette; // generation of the palette texture contents
         uint32_t texW, texH;
+        uint32_t alphaSplit; // (Cs - Cd) * f + Cd where f can exceed 1: drawn in two passes
         bool operator==(const DrawKey &o) const { return std::memcmp(this, &o, sizeof(*this)) == 0; }
     };
 
@@ -490,6 +496,7 @@ private:
     std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t> m_paletteKey{};
     uint32_t m_paletteEntries[256]{};
     uint32_t m_paletteGeneration = 0;
+    uint32_t m_paletteMaxAlpha = 255; // largest alpha in the current palette
     std::array<uint64_t, kPageCount> m_pageVersion{};
     uint64_t m_versionCounter = 0;
     uint64_t m_useCounter = 0;
@@ -1114,6 +1121,9 @@ uint32_t GSGpuRenderer::GetPalette(const GSDrawState &state)
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, GL_RGBA, GL_UNSIGNED_BYTE, entries);
     glActiveTexture(GL_TEXTURE0);
     std::memcpy(m_paletteEntries, entries, sizeof(entries));
+    m_paletteMaxAlpha = 0;
+    for (uint32_t entry : entries)
+        m_paletteMaxAlpha = std::max(m_paletteMaxAlpha, entry >> 24);
     m_paletteKey = key;
     return ++m_paletteGeneration;
 }
@@ -1193,6 +1203,33 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
         key.tfx = ctx.tex0.tfx;
         key.tcc = ctx.tex0.tcc;
         key.clamp = ctx.clamp;
+    }
+    if (key.abe && (key.alpha & 0xCFu) == 0x44u)
+    {
+        // Blend (Cs - Cd) * C + Cd: split when C / 128 can exceed 1 (see the fragment shader).
+        if (((key.alpha >> 4) & 3u) == 2u)
+            key.alphaSplit = ((key.alpha >> 32) & 0xFFu) > 128u ? 1u : 0u;
+        else
+        {
+            uint32_t vertexAlpha = 0;
+            for (uint32_t i = 0; i < batch.vertexCount; ++i)
+                vertexAlpha = std::max<uint32_t>(vertexAlpha, batch.vertices[i].a);
+            uint32_t maxAlpha = vertexAlpha;
+            if (st.prim.tme && ctx.tex0.tcc)
+            {
+                uint32_t texAlpha = 255u;
+                if (isIndexedPsm(ctx.tex0.psm))
+                    texAlpha = m_paletteMaxAlpha;
+                else if (ctx.tex0.psm == GS_PSM_CT24)
+                    texAlpha = st.texa.ta0;
+                else if (ctx.tex0.psm != GS_PSM_CT32)
+                    texAlpha = std::max(st.texa.ta0, st.texa.ta1);
+                maxAlpha = ctx.tex0.tfx == 0u ? (texAlpha * vertexAlpha) >> 7
+                         : ctx.tex0.tfx == 2u ? std::min(texAlpha + vertexAlpha, 255u)
+                                              : texAlpha;
+            }
+            key.alphaSplit = maxAlpha > 128u ? 1u : 0u;
+        }
     }
 
     // Size the targets to what the scissor allows to be drawn.
@@ -1416,6 +1453,7 @@ void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
     // Blending: (A - B) * C / 128 + D with A, B, D in {Cs, Cd, 0} and C in {As, Ad, FIX}, as
     // cs * Cs + cd * Cd. The shader outputs Cs * |cs| and the blend factor f = C / 128; GL applies
     // the sign (equation) and |cd| (destination factor).
+    glUniform1i(U("uAlphaPass"), key.alphaSplit ? 1 : 0);
     if (!key.abe)
     {
         glDisable(GL_BLEND);
@@ -1491,6 +1529,19 @@ void GSGpuRenderer::FlushDraws()
     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_vertices.size() * sizeof(Vertex)), m_vertices.data(), GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_vertices.size()));
+    if (m_key.alphaSplit)
+    {
+        // Second half of the blend: Cs*f - Cd*(f-1) for the pixels with f > 1. Not exact where Cs*f
+        // is above 255 (the shader output saturates before the subtraction), nor where these
+        // primitives overlap each other with f on both sides of 1 (the halves run in sequence).
+        glUniform1i(U("uAlphaPass"), 2);
+        glBlendEquationSeparate(GL_FUNC_SUBTRACT, GL_FUNC_ADD);
+        glBlendFuncSeparate(GL_ONE, GL_SRC1_ALPHA, GL_ONE, GL_ZERO);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_vertices.size()));
+        glUniform1i(U("uAlphaPass"), 1);
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC1_ALPHA, GL_ONE, GL_ZERO);
+    }
     glBindVertexArray(0);
     if (m_keyColor)
         m_keyColor->gpuNewer = true;
@@ -1786,6 +1837,57 @@ namespace
         double sumMeanAbs = 0.0;
         std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     } g_verify;
+
+    // PS2X_GS_GPU_PRIMLOG=N (with PS2X_GS_GPU_VERIFY and PS2X_DUMP_FRAMES): log every primitive drawn
+    // between verified frames N and N+1 to primlog.txt, with its GS state, and dump the comparison of
+    // frame N+1, so the draws under differing pixels can be found (tools/gs/primlog_suspects.py).
+    long PrimLogFrame()
+    {
+        static const long frame = []()
+        {
+            const char *v = std::getenv("PS2X_GS_GPU_PRIMLOG");
+            return v ? std::strtol(v, nullptr, 0) : -1L;
+        }();
+        return frame;
+    }
+
+    void LogPrimitive(const GSPrimitiveBatch &batch)
+    {
+        static FILE *s_log = nullptr;
+        static uint64_t s_index = 0;
+        if (!s_log)
+        {
+            const char *dir = std::getenv("PS2X_DUMP_FRAMES");
+            std::string path = std::string(dir && *dir ? dir : ".") + "/primlog.txt";
+            s_log = std::fopen(path.c_str(), "w");
+            if (!s_log)
+                return;
+            std::fprintf(s_log, "# idx type ctxt nv x0 y0 x1 y1 x2 y2 tme fst tbp tbw tpsm tw th tcc tfx cbp cpsm abe alpha fge "
+                                "fog0 fog1 fog2 rgba0 rgba2 test fbp fbw fpsm fbmsk zbp zpsm zmsk clamp tex1 linear colclamp "
+                                "dthe fba texa iip q0 q2\n");
+        }
+        const GSDrawState &st = batch.state;
+        const GSContext &c = st.context;
+        const float ofx = static_cast<float>(c.xyoffset.ofx) / 16.0f, ofy = static_cast<float>(c.xyoffset.ofy) / 16.0f;
+        const GSVertex *v = batch.vertices.data();
+        const auto rgba = [](const GSVertex &x)
+        { return (uint32_t(x.r) << 24) | (uint32_t(x.g) << 16) | (uint32_t(x.b) << 8) | uint32_t(x.a); };
+        const unsigned last = batch.vertexCount ? batch.vertexCount - 1u : 0u;
+        std::fprintf(s_log,
+                     "%llu %d %d %u %.2f %.2f %.2f %.2f %.2f %.2f %d %d 0x%x %u %u %u %u %u %u 0x%x %u %d 0x%llx %d %u %u %u "
+                     "%08x %08x 0x%llx 0x%x %u %u 0x%08x 0x%x %u %d 0x%llx 0x%llx %d %llu %llu %llu %u/%u/%d %d %g %g\n",
+                     static_cast<unsigned long long>(s_index++), static_cast<int>(st.prim.type), st.prim.ctxt ? 1 : 0,
+                     batch.vertexCount, v[0].x - ofx, v[0].y - ofy, v[1].x - ofx, v[1].y - ofy, v[2].x - ofx, v[2].y - ofy,
+                     st.prim.tme ? 1 : 0, st.prim.fst ? 1 : 0, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, c.tex0.tw, c.tex0.th,
+                     c.tex0.tcc, c.tex0.tfx, c.tex0.cbp, c.tex0.cpsm, st.prim.abe ? 1 : 0,
+                     static_cast<unsigned long long>(c.alpha), st.prim.fge ? 1 : 0, v[0].fog, v[1].fog, v[2].fog, rgba(v[0]),
+                     rgba(v[last]), static_cast<unsigned long long>(c.test), c.frame.fbp, c.frame.fbw, c.frame.psm,
+                     c.frame.fbmsk, c.zbuf.zbp, c.zbuf.psm, c.zbuf.zmask ? 1 : 0, static_cast<unsigned long long>(c.clamp),
+                     static_cast<unsigned long long>(c.tex1), st.linearFilter ? 1 : 0,
+                     static_cast<unsigned long long>(st.colclamp), static_cast<unsigned long long>(st.dthe),
+                     static_cast<unsigned long long>(c.fba), st.texa.ta0, st.texa.ta1, st.texa.aem ? 1 : 0,
+                     st.prim.iip ? 1 : 0, v[0].q, v[last].q);
+    }
 }
 
 bool GSGpuBackend::Requested()
@@ -2039,6 +2141,8 @@ void GSGpuBackend::Execute(Command &command)
     switch (command.type)
     {
     case CommandType::Submit:
+        if (m_shadow && PrimLogFrame() >= 0 && g_verify.frames == static_cast<uint64_t>(PrimLogFrame()))
+            LogPrimitive(command.batch);
         r.Draw(command.batch);
         if (m_shadow)
             m_shadow->Submit(command.batch);
@@ -2146,8 +2250,9 @@ void GSGpuBackend::Execute(Command &command)
                     const char *v = std::getenv("PS2X_GS_GPU_VERIFY_TICK");
                     return v ? std::strtol(v, nullptr, 0) : -1L;
                 }();
-                const bool dumpThis = s_dumpTick >= 0 && command.extra->presentRequest.vsyncTick >= static_cast<uint64_t>(s_dumpTick) &&
-                                      command.extra->presentRequest.vsyncTick < static_cast<uint64_t>(s_dumpTick) + 4u;
+                const bool dumpThis = (s_dumpTick >= 0 && command.extra->presentRequest.vsyncTick >= static_cast<uint64_t>(s_dumpTick) &&
+                                       command.extra->presentRequest.vsyncTick < static_cast<uint64_t>(s_dumpTick) + 4u) ||
+                                      (PrimLogFrame() >= 0 && g_verify.frames == static_cast<uint64_t>(PrimLogFrame()) + 1u);
                 const bool badFrame = bad > n / 400u;
                 static uint32_t s_badDumps = 0;
                 const bool dumpBad = badFrame && s_badDumps < 12u;
