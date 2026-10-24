@@ -1258,6 +1258,9 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.cdRoot = paths.elfDirectory;
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
+    // PS2X_MC_ROOT: memory card directory (slot 1); default mc0 next to the ELF.
+    if (const char *mcRoot = std::getenv("PS2X_MC_ROOT"); mcRoot && *mcRoot)
+        paths.mcRoot = normalizeAbsolutePath(std::filesystem::path(mcRoot));
 
     setIoPaths(paths);
 }
