@@ -1,6 +1,7 @@
 #include "gs_gpu_backend.h"
 
 #include "runtime/gs/ps2_gs_common.h"
+#include "runtime/gs/ps2_gs_memory.h"
 
 #include "external/glad.h" // raylib's loader: its GL entry points are loaded once the window exists
 #include "raylib.h"
@@ -113,10 +114,18 @@ noperspective in float vDepth;
 flat in float vDepthFlat;
 flat in float vDepthConst;
 uniform int uTme;
-uniform int uIndexed;
-uniform usampler2D uIndexTex;
-uniform sampler2D uRgbaTex;
+uniform usampler2D uVram;       // GS memory as 1024 x 1024 32-bit words
+uniform usampler2D uSwizzle;    // page table of the texture's format: [base block % 32][y][x]
 uniform sampler2D uPalette;
+uniform uint uTbp;              // TBP0 (blocks)
+uniform uint uTbw;              // TBW (64-pixel units)
+uniform ivec2 uPageSize;
+uniform uint uUnpackedBits;     // 32, 16, 8 or 4
+uniform uint uBitOffset;        // 24/28 for T8H, T4HL, T4HH
+uniform uint uPackedBytes;      // bytes a read covers: 4, 2 or 1
+uniform int uNibble;            // 4-bit indices
+uniform int uTexFormat;         // 0 raw 32, 1 CT24, 2 CT16, 3 indexed, 4 Z24, 5 Z16
+uniform ivec3 uTexa;            // TA0, TA1, AEM
 uniform ivec2 uTexSize;
 uniform int uFst;
 uniform int uSprite;
@@ -146,17 +155,55 @@ int wrapCoord(int c, int size, int mode, int lo, int hi)
     return (c & lo) | hi;
 }
 
+// GSMem::PixelStorageTraits<psm>::Read, on the GPU copy of GS memory.
+uint readRaw(int x, int y)
+{
+    uint ux = uint(x), uy = uint(y);
+    uint pw = uint(uPageSize.x), ph = uint(uPageSize.y);
+    uint page = uTbp / 32u + (uy / ph) * ((uTbw * 64u) / pw) + ux / pw;
+    uint offs = texelFetch(uSwizzle, ivec2(int(ux % pw), int((uTbp % 32u) * ph + uy % ph)), 0).r;
+    uint bits = (page * pw * ph + offs) * uUnpackedBits + uBitOffset;
+    uint byteAddr = (bits / 8u) & (4194304u - uPackedBytes);
+    uint wordIndex = byteAddr >> 2u;
+    uint word = texelFetch(uVram, ivec2(int(wordIndex & 1023u), int(wordIndex >> 10u)), 0).r;
+    uint shift = (byteAddr & 3u) * 8u;
+    if (uPackedBytes == 4u)
+        return (uTexFormat == 1 || uTexFormat == 4) ? (word & 0xFFFFFFu) : word;
+    if (uPackedBytes == 2u)
+        return (word >> shift) & 0xFFFFu;
+    uint b = (word >> shift) & 0xFFu;
+    return uNibble != 0 ? ((b >> (bits % 8u)) & 0xFu) : b;
+}
+
+// GSCpuBackend::FetchTexelUnlocked: format expansion, TEXA, CLUT.
 vec4 fetchTexel(int u, int v)
 {
     u = wrapCoord(u, uTexSize.x, uWrapMode.x, uRegion.x, uRegion.y);
     v = wrapCoord(v, uTexSize.y, uWrapMode.y, uRegion.z, uRegion.w);
-    ivec2 p = clamp(ivec2(u, v), ivec2(0), uTexSize - 1);
-    if (uIndexed != 0)
+    uint raw = readRaw(u, v);
+    if (uTexFormat == 3)
+        return floor(texelFetch(uPalette, ivec2(int(raw & 0xFFu), 0), 0) * 255.0 + 0.5);
+    uint r, g, b, a;
+    if (uTexFormat == 2 || uTexFormat == 5)
     {
-        uint idx = texelFetch(uIndexTex, p, 0).r;
-        return floor(texelFetch(uPalette, ivec2(int(idx), 0), 0) * 255.0 + 0.5);
+        r = (raw & 0x1Fu) << 3;
+        g = ((raw >> 5) & 0x1Fu) << 3;
+        b = ((raw >> 10) & 0x1Fu) << 3;
+        a = ((raw >> 15) & 1u) << 7;
     }
-    return floor(texelFetch(uRgbaTex, p, 0) * 255.0 + 0.5);
+    else
+    {
+        r = raw & 0xFFu;
+        g = (raw >> 8) & 0xFFu;
+        b = (raw >> 16) & 0xFFu;
+        a = raw >> 24;
+    }
+    bool rgbZero = r == 0u && g == 0u && b == 0u;
+    if (uTexFormat == 1)
+        a = (uTexa.z != 0 && rgbZero) ? 0u : uint(uTexa.x);
+    else if (uTexFormat == 2)
+        a = (a & 0x80u) != 0u ? uint(uTexa.y) : ((uTexa.z != 0 && rgbZero) ? 0u : uint(uTexa.x));
+    return vec4(float(r), float(g), float(b), float(a));
 }
 
 vec4 sampleTexture()
@@ -318,8 +365,11 @@ void main()
 class GSGpuRenderer
 {
 public:
+    void SetVram(uint8_t *vram) { m_vram = vram; }
+
     explicit GSGpuRenderer(GSCpuBackend &cpu) : m_cpu(cpu)
     {
+        m_mirrorVersion.fill(~0ull);
         if (const char *v = std::getenv("PS2X_GS_SCALE"))
             m_scale = static_cast<uint32_t>(std::clamp(std::atoi(v), 1, 8));
     }
@@ -374,16 +424,6 @@ private:
         bool vramNewer = true;
     };
 
-    struct Texture
-    {
-        uint32_t tbp0 = 0, tbw = 0, psm = 0, w = 0, h = 0;
-        uint64_t texaKey = 0;
-        GLuint tex = 0;
-        bool indexed = false;
-        uint32_t tileW = 0, tileH = 0, tilesX = 0, tilesY = 0;
-        std::vector<uint64_t> tileVersion;
-        uint64_t lastUse = 0;
-    };
 
     struct DrawKey
     {
@@ -397,8 +437,9 @@ private:
         uint32_t tme, fst, sprite, linear, tfx, tcc, wrap, fge, ate, atst, aref;
         uint64_t clamp;
         uint32_t fogColor;
-        GLuint texture, palette;
-        uint32_t indexed, texW, texH;
+        uint32_t tbp, tbw, texPsm, texa;
+        GLuint palette;
+        uint32_t texW, texH;
         bool operator==(const DrawKey &o) const { return std::memcmp(this, &o, sizeof(*this)) == 0; }
     };
 
@@ -407,7 +448,11 @@ private:
     void UploadTarget(Target &t);
     void DownloadTarget(Target &t);
     GLuint FramebufferFor(Target *color, Target *depth);
-    Texture *GetTexture(const GSDrawState &state);
+    // Texture reads come from the GPU copy of GS memory: write back targets drawn over the
+    // texture's pages, then bring the copy up to date.
+    void PrepareTextureSource(const GSDrawState &state);
+    void SyncMirror();
+    GLuint SwizzleTable(uint32_t psm, uint32_t &pw, uint32_t &ph);
     GLuint GetPalette(const GSDrawState &state);
     void ApplyKey(const DrawKey &key, Target *color, Target *depth);
     void BumpPages(uint32_t first, uint32_t count);
@@ -426,7 +471,11 @@ private:
 
     std::vector<std::unique_ptr<Target>> m_targets;
     std::map<std::pair<GLuint, GLuint>, GLuint> m_fbos;
-    std::vector<std::unique_ptr<Texture>> m_textures;
+    uint8_t *m_vram = nullptr;
+    GLuint m_mirrorTex = 0;
+    std::array<uint64_t, kPageCount> m_mirrorVersion{};
+    bool m_mirrorDirty = true;
+    std::map<const uint16_t *, GLuint> m_swizzleTables;
     std::map<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t>, GLuint> m_palettes;
     std::array<uint64_t, kPageCount> m_pageVersion{};
     uint64_t m_versionCounter = 0;
@@ -591,6 +640,16 @@ void GSGpuRenderer::EnsureGl()
     glDeleteShader(pvs);
     glDeleteShader(pfs);
     glGenVertexArrays(1, &m_emptyVao);
+
+    glGenTextures(1, &m_mirrorTex);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, m_mirrorTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1024, 1024, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glActiveTexture(GL_TEXTURE0);
+    m_mirrorVersion.fill(~0ull);
+    m_mirrorDirty = true;
     std::cerr << "[gs-gpu] internal resolution x" << m_scale << " (PS2X_GS_SCALE)" << std::endl;
     std::cerr << "[gs-gpu] OpenGL renderer: " << reinterpret_cast<const char *>(glGetString(GL_RENDERER)) << std::endl;
 }
@@ -601,16 +660,19 @@ void GSGpuRenderer::Release()
         return;
     for (auto &t : m_targets)
         glDeleteTextures(1, &t->tex);
-    for (auto &t : m_textures)
-        glDeleteTextures(1, &t->tex);
     for (auto &[k, p] : m_palettes)
         glDeleteTextures(1, &p);
     for (auto &[k, f] : m_fbos)
         glDeleteFramebuffers(1, &f);
+    for (auto &[k, t] : m_swizzleTables)
+        glDeleteTextures(1, &t);
+    if (m_mirrorTex)
+        glDeleteTextures(1, &m_mirrorTex);
+    m_mirrorTex = 0;
     m_targets.clear();
-    m_textures.clear();
     m_palettes.clear();
     m_fbos.clear();
+    m_swizzleTables.clear();
     glDeleteBuffers(1, &m_vbo);
     glDeleteVertexArrays(1, &m_vao);
     glDeleteProgram(m_program);
@@ -659,6 +721,7 @@ void GSGpuRenderer::EndHostWork()
 
 void GSGpuRenderer::BumpPages(uint32_t first, uint32_t count)
 {
+    m_mirrorDirty = true;
     const uint64_t v = ++m_versionCounter;
     for (uint32_t i = 0; i < count; ++i)
         m_pageVersion[(first + i) % kPageCount] = v;
@@ -736,13 +799,10 @@ void GSGpuRenderer::Reset()
     {
         for (auto &t : m_targets)
             glDeleteTextures(1, &t->tex);
-        for (auto &t : m_textures)
-            glDeleteTextures(1, &t->tex);
         for (auto &[k, f] : m_fbos)
             glDeleteFramebuffers(1, &f);
     }
     m_targets.clear();
-    m_textures.clear();
     m_fbos.clear();
     BumpPages(0, kPageCount);
 }
@@ -937,105 +997,73 @@ GLuint GSGpuRenderer::FramebufferFor(Target *color, Target *depth)
     return fbo;
 }
 
-GSGpuRenderer::Texture *GSGpuRenderer::GetTexture(const GSDrawState &state)
+void GSGpuRenderer::PrepareTextureSource(const GSDrawState &state)
 {
     const GSTex0Reg &tex0 = state.context.tex0;
-    const uint32_t w = state.textureWidth, h = state.textureHeight;
-    const bool indexed = isIndexedPsm(tex0.psm);
-    const uint64_t texaKey = indexed ? 0u : (static_cast<uint64_t>(state.texa.ta0) | (static_cast<uint64_t>(state.texa.ta1) << 8) |
-                                             (static_cast<uint64_t>(state.texa.aem) << 16));
-    Texture *tex = nullptr;
-    for (auto &t : m_textures)
-        if (t->tbp0 == tex0.tbp0 && t->tbw == tex0.tbw && t->psm == tex0.psm && t->w == w && t->h == h && t->texaKey == texaKey)
-            tex = t.get();
-    if (!tex)
-    {
-        if (m_textures.size() >= 512u)
-        {
-            auto oldest = std::min_element(m_textures.begin(), m_textures.end(),
-                                           [](const auto &a, const auto &b) { return a->lastUse < b->lastUse; });
-            glDeleteTextures(1, &(*oldest)->tex);
-            m_textures.erase(oldest);
-        }
-        auto t = std::make_unique<Texture>();
-        t->tbp0 = tex0.tbp0;
-        t->tbw = tex0.tbw;
-        t->psm = tex0.psm;
-        t->w = w;
-        t->h = h;
-        t->texaKey = texaKey;
-        t->indexed = indexed;
-        pageSize(tex0.psm, t->tileW, t->tileH);
-        t->tilesX = (w + t->tileW - 1u) / t->tileW;
-        t->tilesY = (h + t->tileH - 1u) / t->tileH;
-        t->tileVersion.assign(t->tilesX * t->tilesY, 0u);
-        glGenTextures(1, &t->tex);
-        glActiveTexture(GL_TEXTURE3);
-        glBindTexture(GL_TEXTURE_2D, t->tex);
-        if (indexed)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, w, h, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, nullptr);
-        else
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glActiveTexture(GL_TEXTURE0);
-        m_textures.push_back(std::move(t));
-        tex = m_textures.back().get();
-    }
-    tex->lastUse = ++m_useCounter;
-
-    // Render to texture: write back any target drawn over these pages first.
     uint32_t first, count;
-    pageSpan(tex0.psm, tex0.tbp0, tex0.tbw, 0u, h, first, count);
+    pageSpan(tex0.psm, tex0.tbp0, tex0.tbw, 0u, state.textureHeight, first, count);
     DownloadOverlapping(first, count, "texture");
+    SyncMirror();
+}
 
-    uint32_t pw, ph;
-    pageSize(tex0.psm, pw, ph);
-    const uint32_t perRow = std::max<uint32_t>(1u, (std::max<uint32_t>(tex0.tbw, 1u) * 64u + pw - 1u) / pw);
-    const bool misaligned = (tex0.tbp0 % 32u) != 0u;
-    bool bound = false;
-    for (uint32_t ty = 0; ty < tex->tilesY; ++ty)
+void GSGpuRenderer::SyncMirror()
+{
+    if (!m_mirrorDirty || !m_vram)
+        return;
+    m_mirrorDirty = false;
+    bool flushed = false;
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, m_mirrorTex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    for (uint32_t page = 0; page < kPageCount;)
     {
-        for (uint32_t tx = 0; tx < tex->tilesX; ++tx)
+        if (m_mirrorVersion[page] == m_pageVersion[page])
         {
-            // Pages wrap within the buffer width, so tile (tx, ty) maps to the page grid modulo the row.
-            const uint32_t page = tex0.tbp0 / 32u + ty * perRow + (tx % perRow);
-            const uint64_t version = std::max<uint64_t>(1u, MaxVersion(page, misaligned ? 2u : 1u));
-            uint64_t &have = tex->tileVersion[ty * tex->tilesX + tx];
-            if (have == version)
-                continue;
-            have = version;
-            if (!bound)
-            {
-                // Draws already batched must sample the old contents.
-                if (m_haveKey && m_key.texture == tex->tex)
-                    FlushDraws();
-                glActiveTexture(GL_TEXTURE3);
-                glBindTexture(GL_TEXTURE_2D, tex->tex);
-                bound = true;
-            }
-            const uint32_t x0 = tx * tex->tileW, y0 = ty * tex->tileH;
-            const uint32_t tw = std::min(tex->tileW, w - x0), th = std::min(tex->tileH, h - y0);
-            m_scratch.resize(tw * th);
-            if (tex->indexed)
-            {
-                m_cpu.ReadRect(tex0.psm, tex0.tbp0, tex0.tbw, x0, y0, tw, th, m_scratch.data());
-                std::vector<uint8_t> idx(tw * th);
-                for (uint32_t i = 0; i < tw * th; ++i)
-                    idx[i] = static_cast<uint8_t>(m_scratch[i]);
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, tw, th, GL_RED_INTEGER, GL_UNSIGNED_BYTE, idx.data());
-            }
-            else
-            {
-                m_cpu.DecodeTexels(state, x0, y0, tw, th, m_scratch.data());
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, tw, th, GL_RGBA, GL_UNSIGNED_BYTE, m_scratch.data());
-            }
+            ++page;
+            continue;
         }
+        uint32_t end = page;
+        while (end < kPageCount && m_mirrorVersion[end] != m_pageVersion[end])
+        {
+            m_mirrorVersion[end] = m_pageVersion[end];
+            ++end;
+        }
+        if (!flushed)
+        {
+            FlushDraws(); // batched draws read the old contents
+            glActiveTexture(GL_TEXTURE3);
+            glBindTexture(GL_TEXTURE_2D, m_mirrorTex);
+            flushed = true;
+        }
+        // A page is 8 KiB: two rows of the 1024-word mirror.
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(page * 2u), 1024, static_cast<GLsizei>((end - page) * 2u),
+                        GL_RED_INTEGER, GL_UNSIGNED_INT, m_vram + static_cast<size_t>(page) * 8192u);
+        page = end;
     }
-    if (bound)
-        glActiveTexture(GL_TEXTURE0);
+    glActiveTexture(GL_TEXTURE0);
+}
+
+GLuint GSGpuRenderer::SwizzleTable(uint32_t psm, uint32_t &pw, uint32_t &ph)
+{
+    const uint16_t *table = GSMem::PageTableData(psm, pw, ph);
+    if (!table)
+    {
+        Note("texture-format");
+        table = GSMem::PageTableData(GS_PSM_CT32, pw, ph);
+    }
+    auto it = m_swizzleTables.find(table);
+    if (it != m_swizzleTables.end())
+        return it->second;
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, pw, 32 * ph, 0, GL_RED_INTEGER, GL_UNSIGNED_SHORT, table);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glActiveTexture(GL_TEXTURE0);
+    m_swizzleTables.emplace(table, tex);
     return tex;
 }
 
@@ -1131,13 +1159,15 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
     if (st.pabe)
         Note("pabe");
 
-    Texture *texture = nullptr;
     if (st.prim.tme)
     {
-        texture = GetTexture(st);
-        key.texture = texture->tex;
-        key.indexed = texture->indexed ? 1u : 0u;
-        key.palette = texture->indexed ? GetPalette(st) : 0u;
+        PrepareTextureSource(st);
+        key.tbp = ctx.tex0.tbp0;
+        key.tbw = ctx.tex0.tbw;
+        key.texPsm = ctx.tex0.psm;
+        key.texa = static_cast<uint32_t>(st.texa.ta0) | (static_cast<uint32_t>(st.texa.ta1) << 8) |
+                   (static_cast<uint32_t>(st.texa.aem) << 16);
+        key.palette = isIndexedPsm(ctx.tex0.psm) ? GetPalette(st) : 0u;
         key.texW = st.textureWidth;
         key.texH = st.textureHeight;
         key.linear = st.linearFilter ? 1u : 0u;
@@ -1313,7 +1343,30 @@ void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
     glUseProgram(m_program);
     glUniform2f(U("uTargetSize"), static_cast<float>(width), static_cast<float>(height));
     glUniform1i(U("uTme"), static_cast<GLint>(key.tme));
-    glUniform1i(U("uIndexed"), static_cast<GLint>(key.indexed));
+    GLuint swizzle = 0;
+    if (key.tme)
+    {
+        uint32_t pw = 64, ph = 32;
+        swizzle = SwizzleTable(key.texPsm, pw, ph);
+        const uint32_t psm = key.texPsm;
+        const bool nibble = psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
+        const uint32_t unpacked = (psm == GS_PSM_T4) ? 4u : (psm == GS_PSM_T8) ? 8u : isSixteenBitPsm(psm) ? 16u : 32u;
+        const uint32_t bitOffset = (psm == GS_PSM_T8H || psm == GS_PSM_T4HL) ? 24u : (psm == GS_PSM_T4HH) ? 28u : 0u;
+        const uint32_t packed = (psm == GS_PSM_T4 || psm == GS_PSM_T8 || psm == GS_PSM_T8H || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH) ? 1u
+                                : isSixteenBitPsm(psm) ? 2u : 4u;
+        const int format = isIndexedPsm(psm) ? 3 : psm == GS_PSM_CT24 ? 1 : (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S) ? 2
+                           : psm == GS_PSM_Z24 ? 4 : (psm == GS_PSM_Z16 || psm == GS_PSM_Z16S) ? 5 : 0;
+        glUniform1ui(U("uTbp"), key.tbp);
+        glUniform1ui(U("uTbw"), key.tbw);
+        glUniform2i(U("uPageSize"), static_cast<GLint>(pw), static_cast<GLint>(ph));
+        glUniform1ui(U("uUnpackedBits"), unpacked);
+        glUniform1ui(U("uBitOffset"), bitOffset);
+        glUniform1ui(U("uPackedBytes"), packed);
+        glUniform1i(U("uNibble"), nibble ? 1 : 0);
+        glUniform1i(U("uTexFormat"), format);
+        glUniform3i(U("uTexa"), static_cast<GLint>(key.texa & 0xFFu), static_cast<GLint>((key.texa >> 8) & 0xFFu),
+                    static_cast<GLint>((key.texa >> 16) & 1u));
+    }
     glUniform1i(U("uFst"), static_cast<GLint>(key.fst));
     glUniform1i(U("uSprite"), static_cast<GLint>(key.sprite));
     glUniform1i(U("uLinear"), static_cast<GLint>(key.linear));
@@ -1330,13 +1383,13 @@ void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
     glUniform1i(U("uAtst"), static_cast<GLint>(key.atst));
     glUniform1f(U("uAref"), static_cast<float>(key.aref));
     glUniform1i(U("uFba"), static_cast<GLint>(key.fba));
-    glUniform1i(U("uIndexTex"), 0);
-    glUniform1i(U("uRgbaTex"), 1);
+    glUniform1i(U("uVram"), 0);
+    glUniform1i(U("uSwizzle"), 1);
     glUniform1i(U("uPalette"), 2);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, key.indexed ? key.texture : 0u);
+    glBindTexture(GL_TEXTURE_2D, key.tme ? m_mirrorTex : 0u);
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, key.indexed ? 0u : key.texture);
+    glBindTexture(GL_TEXTURE_2D, swizzle);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, key.palette);
     glActiveTexture(GL_TEXTURE0);
@@ -2008,6 +2061,7 @@ void GSGpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
     m_vram = vram;
     m_vramSize = vramSize;
     m_cpu.Initialize(vram, vramSize);
+    m_renderer->SetVram(vram);
     if (m_shadow)
     {
         m_shadowVram.assign(vram, vram + vramSize);
