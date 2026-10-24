@@ -1856,7 +1856,12 @@ void GSGpuBackend::Enqueue(Command &&command)
         if (m_ready.size() > kMaxReadyBatches && m_hostStarted.load(std::memory_order_acquire) && !OnHostThread())
         {
             g_host.backpressureWaits.fetch_add(1, std::memory_order_relaxed);
+            const auto waitStart = std::chrono::steady_clock::now();
             m_doneCv.wait(lock, [&]() { return m_ready.size() <= kMaxReadyBatches / 2u || m_stopped; });
+            static const bool s_traceStalls = envFlag("PS2X_TRACE_STALLS");
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+            if (s_traceStalls && ms > 10.0)
+                std::cerr << "[stall] game thread waited " << ms << " ms on a full GS queue" << std::endl;
         }
     }
 }
@@ -1894,6 +1899,8 @@ void GSGpuBackend::RunOnHost(const std::function<void()> &fn) const
         fn();
         return;
     }
+    static const bool s_traceStalls = envFlag("PS2X_TRACE_STALLS");
+    const auto waitStart = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(m_mutex);
     if (m_stopped)
         return;
@@ -1905,6 +1912,12 @@ void GSGpuBackend::RunOnHost(const std::function<void()> &fn) const
     const uint64_t target = ++self->m_queued;
     self->PublishLocked();
     m_doneCv.wait(lock, [&]() { return m_completed >= target || m_stopped; });
+    if (s_traceStalls)
+    {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+        if (ms > 10.0)
+            std::cerr << "[stall] game thread waited " << ms << " ms for a host call" << std::endl;
+    }
 }
 
 void GSGpuBackend::ExecuteBatch(std::vector<Command> &commands)
