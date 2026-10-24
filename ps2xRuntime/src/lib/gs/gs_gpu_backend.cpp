@@ -1,4 +1,5 @@
 #include "gs_gpu_backend.h"
+#include "gs_threaded_backend.h"
 
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_memory.h"
@@ -1798,8 +1799,16 @@ GSGpuBackend::GSGpuBackend()
     m_renderer = std::make_unique<GSGpuRenderer>(m_cpu);
     if (envFlag("PS2X_GS_GPU_VERIFY"))
     {
-        m_shadow = std::make_unique<GSCpuBackend>();
-        std::cerr << "[gs-gpu] verifying against the CPU rasterizer (PS2X_GS_GPU_VERIFY)" << std::endl;
+        // The reference runs on the host thread in step with the GPU; split across PS2X_GS_THREADS
+        // workers like the CPU renderer, or screens heavy in large sprites (the memory card loading
+        // screen) drop the game to a few frames a minute.
+        const uint32_t workers = GSThreadedBackend::ConfiguredWorkers();
+        if (workers == 0u)
+            m_shadow = std::make_unique<GSCpuBackend>();
+        else
+            m_shadow = std::make_unique<GSThreadedBackend>([]() { return std::make_unique<GSCpuBackend>(); }, workers);
+        std::cerr << "[gs-gpu] verifying against the CPU rasterizer (PS2X_GS_GPU_VERIFY, " << workers << " workers)"
+                  << std::endl;
     }
     std::cerr << "[gs-gpu] GPU GS backend (PS2X_GS_BACKEND=cpu for the CPU rasterizer)" << std::endl;
 }

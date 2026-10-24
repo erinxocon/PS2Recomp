@@ -126,7 +126,7 @@ private:
 
     GSCpuBackend m_cpu;                       // GS memory side (host thread only once pumping)
     std::unique_ptr<GSGpuRenderer> m_renderer; // GL side (host thread only)
-    std::unique_ptr<GSCpuBackend> m_shadow;   // PS2X_GS_GPU_VERIFY reference rasterizer
+    std::unique_ptr<GSRasterBackend> m_shadow; // PS2X_GS_GPU_VERIFY reference rasterizer
     std::vector<uint8_t> m_shadowVram;
     uint8_t *m_vram = nullptr;
     uint32_t m_vramSize = 0;
