@@ -5,6 +5,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "gs/gs_gpu_backend.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -2559,9 +2560,22 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    // With the GPU GS backend, GS commands run on this thread: pump them until each frame is due
+    // instead of letting raylib sleep in EndDrawing.
+    GSGpuBackend *gpuBackend = m_gs.gpuBackend();
+    if (gpuBackend)
+        SetTargetFPS(0);
+    auto nextHostFrame = std::chrono::steady_clock::now();
+
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        if (gpuBackend)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            nextHostFrame = std::max(nextHostFrame + std::chrono::microseconds(16667), now - std::chrono::milliseconds(50));
+            gpuBackend->PumpHostThread(nextHostFrame);
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
@@ -2679,6 +2693,8 @@ void PS2Runtime::run()
     }
 
     requestStop();
+    if (gpuBackend)
+        gpuBackend->ShutdownHostThread();
     if (gameThread.joinable())
     {
         gameThread.join();

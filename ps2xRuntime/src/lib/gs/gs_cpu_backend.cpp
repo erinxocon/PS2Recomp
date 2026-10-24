@@ -597,6 +597,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
     if (!sixteenBit && !thirtyTwoBit)
         return;
 
+    m_clutVersion.fetch_add(1u, std::memory_order_relaxed);
     const uint32_t entryCount = fourBit ? 16u : 256u;
     const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
     const uint32_t destinationBase = (static_cast<uint32_t>(tex0.csa) & csaMask) << 4u;
@@ -1091,30 +1092,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     {
         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
-
-        u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
-
-        switch (tex.psm)
-        {
-        case GS_PSM_CT32:
-        case GS_PSM_Z32:
-        case GS_PSM_CT24:
-        case GS_PSM_Z24:
-            return applyTexa(state.texa, tex.psm, out);
-        case GS_PSM_CT16:
-        case GS_PSM_CT16S:
-        case GS_PSM_Z16:
-        case GS_PSM_Z16S:
-            return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
-        case GS_PSM_T8:
-        case GS_PSM_T8H:
-        case GS_PSM_T4:
-        case GS_PSM_T4HL:
-        case GS_PSM_T4HH:
-            return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
-        }
-
-        return 0xFFFF00FFu;
+        return FetchTexelUnlocked(state, sampleU, sampleV);
     };
 
     static const bool s_pointSample = std::getenv("PS2X_POINT_SAMPLE") != nullptr;
@@ -1162,6 +1140,72 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
            (static_cast<uint32_t>(g) << 8) |
            (static_cast<uint32_t>(b) << 16) |
            (static_cast<uint32_t>(a) << 24);
+}
+
+uint32_t GSCpuBackend::FetchTexelUnlocked(const GSDrawState &state, int u, int v)
+{
+    const auto &tex = state.context.tex0;
+    const u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, u, v);
+    switch (tex.psm)
+    {
+    case GS_PSM_CT32:
+    case GS_PSM_Z32:
+    case GS_PSM_CT24:
+    case GS_PSM_Z24:
+        return applyTexa(state.texa, tex.psm, out);
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+    case GS_PSM_Z16:
+    case GS_PSM_Z16S:
+        return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
+    case GS_PSM_T8:
+    case GS_PSM_T8H:
+    case GS_PSM_T4:
+    case GS_PSM_T4HL:
+    case GS_PSM_T4HH:
+        return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
+    }
+    return 0xFFFF00FFu;
+}
+
+void GSCpuBackend::ReadRect(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                            uint32_t *out) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_vram)
+        return;
+    const ReadVramFunc read = m_readVramFuncs[psm & (kPsmHandlerCount - 1u)];
+    for (uint32_t j = 0; j < h; ++j)
+        for (uint32_t i = 0; i < w; ++i)
+            *out++ = read(m_vram, base, bw, x + i, y + j);
+}
+
+void GSCpuBackend::WriteRect(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             const uint32_t *in)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_vram)
+        return;
+    const WriteVramFunc write = m_writeVramFuncs[psm & (kPsmHandlerCount - 1u)];
+    for (uint32_t j = 0; j < h; ++j)
+        for (uint32_t i = 0; i < w; ++i)
+            write(m_vram, base, bw, x + i, y + j, *in++);
+    m_texturePageCache.Invalidate();
+}
+
+void GSCpuBackend::DecodeTexels(const GSDrawState &state, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t *out)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (uint32_t j = 0; j < h; ++j)
+        for (uint32_t i = 0; i < w; ++i)
+            *out++ = m_vram ? FetchTexelUnlocked(state, static_cast<int>(x0 + i), static_cast<int>(y0 + j)) : 0u;
+}
+
+uint32_t GSCpuBackend::PaletteEntry(const GSDrawState &state, uint8_t index)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto &tex = state.context.tex0;
+    return LookupCLUT(state, index, tex.cpsm, tex.csm, tex.csa, tex.psm);
 }
 
 void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)

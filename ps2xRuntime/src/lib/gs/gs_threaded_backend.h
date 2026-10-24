@@ -51,11 +51,10 @@ public:
     // Worker count from PS2X_GS_THREADS (default 6); 0 disables threading.
     static uint32_t ConfiguredWorkers();
 
-    using PresentCallback = std::function<void(PresentationFrame &&)>;
     // Presents behind the commands queued so far without waiting for them: worker 0 builds the
-    // frame once those draws are done and hands it to the callback (on that worker thread). Returns
-    // false, queueing nothing, while an earlier one is still pending.
-    bool PresentAsync(const GSPresentationRequest &request, PresentCallback callback);
+    // frame once those draws are done and hands it to the callback (on that worker thread).
+    bool SupportsAsyncPresent() const override { return true; }
+    bool PresentAsync(const GSPresentationRequest &request, PresentCallback callback) override;
 
 private:
     enum class CommandType : uint8_t

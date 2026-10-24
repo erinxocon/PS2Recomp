@@ -1,0 +1,1639 @@
+#include "gs_gpu_backend.h"
+
+#include "runtime/gs/ps2_gs_common.h"
+
+#include "external/glad.h" // raylib's loader: its GL entry points are loaded once the window exists
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <map>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+
+namespace
+{
+    constexpr uint32_t kPageCount = 512u; // 4 MiB of GS memory in 8 KiB pages
+    constexpr double kDepthScale = 1.0 / 4294967296.0;
+
+    bool isDepthPsm(uint32_t psm) { return psm == GS_PSM_Z32 || psm == GS_PSM_Z24 || psm == GS_PSM_Z16 || psm == GS_PSM_Z16S; }
+    bool isSixteenBitPsm(uint32_t psm) { return psm == GS_PSM_CT16 || psm == GS_PSM_CT16S || psm == GS_PSM_Z16 || psm == GS_PSM_Z16S; }
+    bool isIndexedPsm(uint32_t psm)
+    {
+        return psm == GS_PSM_T8 || psm == GS_PSM_T8H || psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
+    }
+
+    // Page dimensions in pixels for each storage format.
+    void pageSize(uint32_t psm, uint32_t &w, uint32_t &h)
+    {
+        switch (psm)
+        {
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            w = 64u, h = 64u;
+            break;
+        case GS_PSM_T8:
+            w = 128u, h = 64u;
+            break;
+        case GS_PSM_T4:
+            w = 128u, h = 128u;
+            break;
+        default: // 32-bit layouts, including T8H/T4HL/T4HH
+            w = 64u, h = 32u;
+            break;
+        }
+    }
+
+    // Pages a w x h rectangle at (x, y) of a buffer at block `bp` with width `bw` (64-pixel units)
+    // can touch. Conservative: whole page rows, plus one page when the base is not page aligned.
+    void pageSpan(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t y, uint32_t h, uint32_t &first, uint32_t &count)
+    {
+        uint32_t pw, ph;
+        pageSize(psm, pw, ph);
+        const uint32_t perRow = std::max<uint32_t>(1u, (std::max<uint32_t>(bw, 1u) * 64u + pw - 1u) / pw);
+        const uint32_t rowFirst = y / ph;
+        const uint32_t rowLast = (y + std::max<uint32_t>(h, 1u) - 1u) / ph;
+        first = bp / 32u + rowFirst * perRow;
+        count = (rowLast - rowFirst + 1u) * perRow + ((bp % 32u) ? 1u : 0u);
+    }
+
+    uint32_t rgba5551To8888(uint32_t c)
+    {
+        const uint32_t r = (c & 0x1Fu) << 3, g = ((c >> 5) & 0x1Fu) << 3, b = ((c >> 10) & 0x1Fu) << 3;
+        const uint32_t a = (c & 0x8000u) ? 0x80u : 0u;
+        return r | (g << 8) | (b << 16) | (a << 24);
+    }
+
+    uint32_t rgba8888To5551(uint32_t c)
+    {
+        return ((c & 0xFFu) >> 3) | ((((c >> 8) & 0xFFu) >> 3) << 5) | ((((c >> 16) & 0xFFu) >> 3) << 10) |
+               (((c >> 31) & 1u) << 15);
+    }
+
+    const char *kVertexShader = R"(#version 330
+layout(location = 0) in vec3 aPos;        // GS window x, y; z as depth in [0, 1]
+layout(location = 1) in vec4 aColor;      // 0..255
+layout(location = 2) in vec3 aStq;        // S T Q, or U V (1/16 texels) and 1
+layout(location = 3) in vec2 aFogZconst;  // fog 0..255, 1 when the primitive has constant Z
+uniform vec2 uTargetSize;
+noperspective out vec4 vColor;
+noperspective out vec3 vStq;
+noperspective out float vFog;
+noperspective out float vDepth;
+flat out float vDepthFlat;
+flat out float vDepthConst;
+void main()
+{
+    gl_Position = vec4(aPos.x / uTargetSize.x * 2.0 - 1.0, aPos.y / uTargetSize.y * 2.0 - 1.0, 0.0, 1.0);
+    vColor = aColor;
+    vStq = aStq;
+    vFog = aFogZconst.x;
+    vDepth = aPos.z;
+    vDepthFlat = aPos.z;
+    vDepthConst = aFogZconst.y;
+}
+)";
+
+    // Mirrors GSCpuBackend's per-pixel pipeline: texture fetch (point or 4-tap bilinear with the
+    // GS wrap modes, CLUT in a palette texture), texture function, fog, alpha test, FBA. Blending is
+    // left to GL with the factors set up per draw (oBlend carries the blend factor).
+    const char *kFragmentShader = R"(#version 330
+noperspective in vec4 vColor;
+noperspective in vec3 vStq;
+noperspective in float vFog;
+noperspective in float vDepth;
+flat in float vDepthFlat;
+flat in float vDepthConst;
+uniform int uTme;
+uniform int uIndexed;
+uniform usampler2D uIndexTex;
+uniform sampler2D uRgbaTex;
+uniform sampler2D uPalette;
+uniform ivec2 uTexSize;
+uniform int uFst;
+uniform int uSprite;
+uniform int uLinear;
+uniform ivec2 uWrapMode;
+uniform ivec4 uRegion;          // minU maxU minV maxV
+uniform int uTfx;
+uniform int uTcc;
+uniform int uFge;
+uniform vec3 uFogColor;
+uniform int uAte;
+uniform int uAtst;
+uniform float uAref;
+uniform int uFba;
+uniform int uBlendC;            // 0 As, 1 Ad (unsupported, treated as As), 2 FIX
+uniform float uBlendFix;
+uniform float uSrcScale;        // multiplier for the source colour (|cs| of the blend), < 0 = use alpha factor
+uniform int uSrcScaleMode;      // 0: 1, 1: f, 2: 1 - f, 3: 1 + f
+layout(location = 0, index = 0) out vec4 oColor;
+layout(location = 0, index = 1) out vec4 oBlend;
+
+int wrapCoord(int c, int size, int mode, int lo, int hi)
+{
+    if (mode == 0) return c & (size - 1);
+    if (mode == 1) return clamp(c, 0, size - 1);
+    if (mode == 2) return clamp(c, lo, hi);
+    return (c & lo) | hi;
+}
+
+vec4 fetchTexel(int u, int v)
+{
+    u = wrapCoord(u, uTexSize.x, uWrapMode.x, uRegion.x, uRegion.y);
+    v = wrapCoord(v, uTexSize.y, uWrapMode.y, uRegion.z, uRegion.w);
+    ivec2 p = clamp(ivec2(u, v), ivec2(0), uTexSize - 1);
+    if (uIndexed != 0)
+    {
+        uint idx = texelFetch(uIndexTex, p, 0).r;
+        return floor(texelFetch(uPalette, ivec2(int(idx), 0), 0) * 255.0 + 0.5);
+    }
+    return floor(texelFetch(uRgbaTex, p, 0) * 255.0 + 0.5);
+}
+
+vec4 sampleTexture()
+{
+    float tu, tv;
+    if (uFst != 0)
+    {
+        float su = uSprite != 0 ? floor(vStq.x + 0.5) : floor(vStq.x + 1.0e-3);
+        float sv = uSprite != 0 ? floor(vStq.y + 0.5) : floor(vStq.y + 1.0e-3);
+        tu = su / 16.0;
+        tv = sv / 16.0;
+    }
+    else
+    {
+        float q = abs(vStq.z) > 1.0e-8 ? vStq.z : 1.0;
+        tu = vStq.x / q * float(uTexSize.x);
+        tv = vStq.y / q * float(uTexSize.y);
+    }
+    if (uLinear == 0)
+        return fetchTexel(int(tu), int(tv));
+    float su = tu - 0.5, sv = tv - 0.5;
+    int u0 = int(floor(su)), v0 = int(floor(sv));
+    float fx = su - float(u0), fy = sv - float(v0);
+    vec4 c00 = fetchTexel(u0, v0), c10 = fetchTexel(u0 + 1, v0);
+    vec4 c01 = fetchTexel(u0, v0 + 1), c11 = fetchTexel(u0 + 1, v0 + 1);
+    vec4 top = c00 + (c10 - c00) * fx;
+    vec4 bottom = c01 + (c11 - c01) * fx;
+    return floor(top + (bottom - top) * fy + 0.5);
+}
+
+void main()
+{
+    vec4 c = floor(vColor + 1.0e-3);
+    if (uTme != 0)
+    {
+        vec4 t = sampleTexture();
+        if (uTfx == 0)
+            c = vec4(min(floor(t.rgb * c.rgb / 128.0), 255.0), uTcc != 0 ? min(floor(t.a * c.a / 128.0), 255.0) : c.a);
+        else if (uTfx == 1)
+            c = vec4(t.rgb, uTcc != 0 ? t.a : c.a);
+        else if (uTfx == 2)
+            c = vec4(min(floor(t.rgb * c.rgb / 128.0) + c.a, 255.0), uTcc != 0 ? min(t.a + c.a, 255.0) : c.a);
+        else
+            c = vec4(min(floor(t.rgb * c.rgb / 128.0) + c.a, 255.0), uTcc != 0 ? t.a : c.a);
+    }
+    if (uFge != 0)
+    {
+        float f = clamp(floor(vFog + 1.0e-3), 0.0, 255.0);
+        c.rgb = floor(f * c.rgb / 256.0) + floor((255.0 - f) * uFogColor / 256.0);
+    }
+    if (uAte != 0)
+    {
+        bool pass = true;
+        if (uAtst == 0) pass = false;
+        else if (uAtst == 2) pass = c.a < uAref;
+        else if (uAtst == 3) pass = c.a <= uAref;
+        else if (uAtst == 4) pass = c.a == uAref;
+        else if (uAtst == 5) pass = c.a >= uAref;
+        else if (uAtst == 6) pass = c.a > uAref;
+        else if (uAtst == 7) pass = c.a != uAref;
+        if (!pass) discard;
+    }
+    float alpha = c.a;
+    float f = (uBlendC == 2 ? uBlendFix : alpha) / 128.0;
+    float s = uSrcScaleMode == 0 ? 1.0 : uSrcScaleMode == 1 ? f : uSrcScaleMode == 2 ? 1.0 - f : 1.0 + f;
+    if (uFba != 0 && c.a < 128.0) alpha = c.a + 128.0;
+    oColor = vec4(c.rgb * s / 255.0, alpha / 255.0);
+    oBlend = vec4(clamp(f, 0.0, 1.0));
+    gl_FragDepth = vDepthConst > 0.5 ? vDepthFlat : vDepth;
+}
+)";
+
+    GLuint compileShader(GLenum type, const char *source)
+    {
+        GLuint shader = glCreateShader(type);
+        glShaderSource(shader, 1, &source, nullptr);
+        glCompileShader(shader);
+        GLint ok = 0;
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+        if (!ok)
+        {
+            char log[4096];
+            glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+            std::cerr << "[gs-gpu] shader compile failed: " << log << std::endl;
+        }
+        return shader;
+    }
+
+    struct Vertex
+    {
+        float x, y, z;
+        float r, g, b, a;
+        float s, t, q;
+        float fog, zconst;
+    };
+}
+
+// ---------------------------------------------------------------------------------------------------
+// GL renderer (host thread only)
+// ---------------------------------------------------------------------------------------------------
+
+class GSGpuRenderer
+{
+public:
+    explicit GSGpuRenderer(GSCpuBackend &cpu) : m_cpu(cpu) {}
+    ~GSGpuRenderer() { Release(); }
+
+    void EnsureGl();
+    void Release();
+    void BeginHostWork();
+    void EndHostWork();
+
+    void Draw(const GSPrimitiveBatch &batch);
+    void FlushDraws();
+
+    // Make GS memory current for pages [first, first + count) (or all of it).
+    void DownloadOverlapping(uint32_t first, uint32_t count);
+    void DownloadAll();
+    // GS memory in [first, first + count) was written by someone else.
+    void InvalidatePages(uint32_t first, uint32_t count);
+    void InvalidateAll();
+    void Reset();
+
+    uint64_t unsupported = 0;
+
+private:
+    struct Target
+    {
+        uint32_t fbp = 0, fbw = 0, psm = 0;
+        bool depth = false;
+        uint32_t width = 0, height = 0;
+        uint32_t firstPage = 0, pageCount = 0;
+        GLuint tex = 0;
+        bool gpuNewer = false;
+        bool vramNewer = true;
+    };
+
+    struct Texture
+    {
+        uint32_t tbp0 = 0, tbw = 0, psm = 0, w = 0, h = 0;
+        uint64_t texaKey = 0;
+        GLuint tex = 0;
+        bool indexed = false;
+        uint32_t tileW = 0, tileH = 0, tilesX = 0, tilesY = 0;
+        std::vector<uint64_t> tileVersion;
+        uint64_t lastUse = 0;
+    };
+
+    struct DrawKey
+    {
+        uint32_t colorFbp, colorFbw, colorPsm, zbp, zpsm;
+        uint32_t depthMode; // 0 none, 1 test only, 2 test + write
+        uint32_t ztst;
+        uint32_t scissor[4];
+        uint32_t colorMask;
+        uint64_t alpha;
+        uint32_t abe, colclamp, fba;
+        uint32_t tme, fst, sprite, linear, tfx, tcc, wrap, fge, ate, atst, aref;
+        uint64_t clamp;
+        uint32_t fogColor;
+        GLuint texture, palette;
+        uint32_t indexed, texW, texH;
+        bool operator==(const DrawKey &o) const { return std::memcmp(this, &o, sizeof(*this)) == 0; }
+    };
+
+    Target *FindOrCreateTarget(uint32_t fbp, uint32_t fbw, uint32_t psm, bool depth, uint32_t height);
+    void RetireTarget(Target &t);
+    void UploadTarget(Target &t);
+    void DownloadTarget(Target &t);
+    GLuint FramebufferFor(Target *color, Target *depth);
+    Texture *GetTexture(const GSDrawState &state);
+    GLuint GetPalette(const GSDrawState &state);
+    void ApplyKey(const DrawKey &key, Target *color, Target *depth);
+    void BumpPages(uint32_t first, uint32_t count);
+    uint64_t MaxVersion(uint32_t first, uint32_t count) const;
+
+    GSCpuBackend &m_cpu;
+    bool m_glReady = false;
+    GLuint m_program = 0, m_vao = 0, m_vbo = 0;
+    std::unordered_map<std::string, GLint> m_uniforms;
+    GLint U(const char *name);
+
+    std::vector<std::unique_ptr<Target>> m_targets;
+    std::map<std::pair<GLuint, GLuint>, GLuint> m_fbos;
+    std::vector<std::unique_ptr<Texture>> m_textures;
+    std::map<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t>, GLuint> m_palettes;
+    std::array<uint64_t, kPageCount> m_pageVersion{};
+    uint64_t m_versionCounter = 0;
+    uint64_t m_useCounter = 0;
+
+    std::vector<Vertex> m_vertices;
+    DrawKey m_key{};
+    bool m_haveKey = false;
+    Target *m_keyColor = nullptr;
+    Target *m_keyDepth = nullptr;
+    GLint m_savedViewport[4]{};
+    GLboolean m_cullWasEnabled = GL_FALSE;
+    std::vector<uint32_t> m_scratch;
+    std::vector<float> m_scratchF;
+};
+
+GLint GSGpuRenderer::U(const char *name)
+{
+    auto it = m_uniforms.find(name);
+    if (it != m_uniforms.end())
+        return it->second;
+    const GLint loc = glGetUniformLocation(m_program, name);
+    m_uniforms.emplace(name, loc);
+    return loc;
+}
+
+void GSGpuRenderer::EnsureGl()
+{
+    if (m_glReady)
+        return;
+    m_glReady = true;
+    const GLuint vs = compileShader(GL_VERTEX_SHADER, kVertexShader);
+    const GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFragmentShader);
+    m_program = glCreateProgram();
+    glAttachShader(m_program, vs);
+    glAttachShader(m_program, fs);
+    glLinkProgram(m_program);
+    GLint ok = 0;
+    glGetProgramiv(m_program, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char log[4096];
+        glGetProgramInfoLog(m_program, sizeof(log), nullptr, log);
+        std::cerr << "[gs-gpu] program link failed: " << log << std::endl;
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    glGenVertexArrays(1, &m_vao);
+    glGenBuffers(1, &m_vbo);
+    glBindVertexArray(m_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void *>(offsetof(Vertex, x)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void *>(offsetof(Vertex, r)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void *>(offsetof(Vertex, s)));
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void *>(offsetof(Vertex, fog)));
+    glBindVertexArray(0);
+    std::cerr << "[gs-gpu] OpenGL renderer: " << reinterpret_cast<const char *>(glGetString(GL_RENDERER)) << std::endl;
+}
+
+void GSGpuRenderer::Release()
+{
+    if (!m_glReady)
+        return;
+    for (auto &t : m_targets)
+        glDeleteTextures(1, &t->tex);
+    for (auto &t : m_textures)
+        glDeleteTextures(1, &t->tex);
+    for (auto &[k, p] : m_palettes)
+        glDeleteTextures(1, &p);
+    for (auto &[k, f] : m_fbos)
+        glDeleteFramebuffers(1, &f);
+    m_targets.clear();
+    m_textures.clear();
+    m_palettes.clear();
+    m_fbos.clear();
+    glDeleteBuffers(1, &m_vbo);
+    glDeleteVertexArrays(1, &m_vao);
+    glDeleteProgram(m_program);
+    m_glReady = false;
+}
+
+void GSGpuRenderer::BeginHostWork()
+{
+    EnsureGl();
+    glGetIntegerv(GL_VIEWPORT, m_savedViewport);
+    m_cullWasEnabled = glIsEnabled(GL_CULL_FACE);
+    glDisable(GL_CULL_FACE); // the GS draws both windings; raylib enables back-face culling
+    m_haveKey = false;       // raylib changed the GL state since the last pump
+}
+
+// Leave GL the way raylib expects it (raylib caches its own state).
+void GSGpuRenderer::EndHostWork()
+{
+    FlushDraws();
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(m_savedViewport[0], m_savedViewport[1], m_savedViewport[2], m_savedViewport[3]);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(0);
+    glBindVertexArray(0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    if (m_cullWasEnabled)
+        glEnable(GL_CULL_FACE);
+}
+
+void GSGpuRenderer::BumpPages(uint32_t first, uint32_t count)
+{
+    const uint64_t v = ++m_versionCounter;
+    for (uint32_t i = 0; i < count; ++i)
+        m_pageVersion[(first + i) % kPageCount] = v;
+}
+
+uint64_t GSGpuRenderer::MaxVersion(uint32_t first, uint32_t count) const
+{
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < count; ++i)
+        v = std::max(v, m_pageVersion[(first + i) % kPageCount]);
+    return v;
+}
+
+static bool rangesOverlap(uint32_t a, uint32_t an, uint32_t b, uint32_t bn)
+{
+    return a < b + bn && b < a + an;
+}
+
+void GSGpuRenderer::DownloadOverlapping(uint32_t first, uint32_t count)
+{
+    for (auto &t : m_targets)
+        if (t->gpuNewer && rangesOverlap(t->firstPage, t->pageCount, first, count))
+            DownloadTarget(*t);
+}
+
+void GSGpuRenderer::DownloadAll()
+{
+    FlushDraws();
+    for (auto &t : m_targets)
+        if (t->gpuNewer)
+            DownloadTarget(*t);
+}
+
+void GSGpuRenderer::InvalidatePages(uint32_t first, uint32_t count)
+{
+    BumpPages(first, count);
+    for (auto &t : m_targets)
+        if (rangesOverlap(t->firstPage, t->pageCount, first, count))
+            t->vramNewer = true;
+}
+
+void GSGpuRenderer::InvalidateAll()
+{
+    InvalidatePages(0, kPageCount);
+}
+
+void GSGpuRenderer::Reset()
+{
+    m_vertices.clear();
+    m_haveKey = false;
+    if (m_glReady)
+    {
+        for (auto &t : m_targets)
+            glDeleteTextures(1, &t->tex);
+        for (auto &t : m_textures)
+            glDeleteTextures(1, &t->tex);
+        for (auto &[k, f] : m_fbos)
+            glDeleteFramebuffers(1, &f);
+    }
+    m_targets.clear();
+    m_textures.clear();
+    m_fbos.clear();
+    BumpPages(0, kPageCount);
+}
+
+void GSGpuRenderer::RetireTarget(Target &t)
+{
+    if (t.gpuNewer)
+        DownloadTarget(t);
+    if (&t == m_keyColor || &t == m_keyDepth)
+    {
+        FlushDraws();
+        m_haveKey = false;
+        m_keyColor = m_keyDepth = nullptr;
+    }
+    for (auto it = m_fbos.begin(); it != m_fbos.end();)
+    {
+        if (it->first.first == t.tex || it->first.second == t.tex)
+        {
+            glDeleteFramebuffers(1, &it->second);
+            it = m_fbos.erase(it);
+        }
+        else
+            ++it;
+    }
+    glDeleteTextures(1, &t.tex);
+    t.tex = 0;
+}
+
+GSGpuRenderer::Target *GSGpuRenderer::FindOrCreateTarget(uint32_t fbp, uint32_t fbw, uint32_t psm, bool depth, uint32_t height)
+{
+    uint32_t pw, ph;
+    pageSize(psm, pw, ph);
+    height = std::min<uint32_t>(2048u, ((std::max<uint32_t>(height, 1u) + ph - 1u) / ph) * ph);
+    const uint32_t width = std::max<uint32_t>(fbw, 1u) * 64u;
+    const bool sixteen = isSixteenBitPsm(psm);
+
+    Target *match = nullptr;
+    for (auto &t : m_targets)
+        if (t->fbp == fbp && t->fbw == fbw && t->depth == depth && isSixteenBitPsm(t->psm) == sixteen)
+            match = t.get();
+    if (match && match->height >= height)
+    {
+        match->psm = psm;
+        return match;
+    }
+
+    uint32_t first, count;
+    pageSpan(psm, fbp * 32u, fbw, 0u, height, first, count);
+    // Anything else on these pages becomes stale: write it back and drop it.
+    FlushDraws();
+    for (auto it = m_targets.begin(); it != m_targets.end();)
+    {
+        Target &t = **it;
+        if (&t == match || rangesOverlap(t.firstPage, t.pageCount, first, count))
+        {
+            RetireTarget(t);
+            it = m_targets.erase(it);
+        }
+        else
+            ++it;
+    }
+
+    auto t = std::make_unique<Target>();
+    t->fbp = fbp;
+    t->fbw = fbw;
+    t->psm = psm;
+    t->depth = depth;
+    t->width = width;
+    t->height = height;
+    t->firstPage = first;
+    t->pageCount = count;
+    glGenTextures(1, &t->tex);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, t->tex);
+    if (depth)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, width, height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    else
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glActiveTexture(GL_TEXTURE0);
+    t->vramNewer = true;
+    m_targets.push_back(std::move(t));
+    return m_targets.back().get();
+}
+
+void GSGpuRenderer::UploadTarget(Target &t)
+{
+    const uint32_t n = t.width * t.height;
+    m_scratch.resize(n);
+    m_cpu.ReadRect(t.psm, t.fbp * 32u, t.fbw, 0, 0, t.width, t.height, m_scratch.data());
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, t.tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    if (t.depth)
+    {
+        m_scratchF.resize(n);
+        for (uint32_t i = 0; i < n; ++i)
+            m_scratchF[i] = static_cast<float>(static_cast<double>(m_scratch[i]) * kDepthScale);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, t.width, t.height, GL_DEPTH_COMPONENT, GL_FLOAT, m_scratchF.data());
+    }
+    else
+    {
+        if (isSixteenBitPsm(t.psm))
+            for (uint32_t &c : m_scratch)
+                c = rgba5551To8888(c);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, t.width, t.height, GL_RGBA, GL_UNSIGNED_BYTE, m_scratch.data());
+    }
+    glActiveTexture(GL_TEXTURE0);
+    t.vramNewer = false;
+}
+
+void GSGpuRenderer::DownloadTarget(Target &t)
+{
+    if (m_keyColor == &t || m_keyDepth == &t)
+        FlushDraws();
+    const uint32_t n = t.width * t.height;
+    m_scratch.resize(n);
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, t.depth ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    if (t.depth)
+    {
+        glReadBuffer(GL_NONE);
+        m_scratchF.resize(n);
+        glReadPixels(0, 0, t.width, t.height, GL_DEPTH_COMPONENT, GL_FLOAT, m_scratchF.data());
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            const double z = std::floor(static_cast<double>(m_scratchF[i]) / kDepthScale + 0.5);
+            m_scratch[i] = static_cast<uint32_t>(std::min(std::max(z, 0.0), 4294967295.0));
+        }
+    }
+    else
+    {
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(0, 0, t.width, t.height, GL_RGBA, GL_UNSIGNED_BYTE, m_scratch.data());
+        if (isSixteenBitPsm(t.psm))
+            for (uint32_t &c : m_scratch)
+                c = rgba8888To5551(c);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    m_cpu.WriteRect(t.psm, t.fbp * 32u, t.fbw, 0, 0, t.width, t.height, m_scratch.data());
+    BumpPages(t.firstPage, t.pageCount);
+    t.gpuNewer = false;
+}
+
+GLuint GSGpuRenderer::FramebufferFor(Target *color, Target *depth)
+{
+    const auto key = std::make_pair(color ? color->tex : 0u, depth ? depth->tex : 0u);
+    auto it = m_fbos.find(key);
+    if (it != m_fbos.end())
+        return it->second;
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    if (color)
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color->tex, 0);
+    if (depth)
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth->tex, 0);
+    if (!color)
+    {
+        glDrawBuffer(GL_NONE);
+        glReadBuffer(GL_NONE);
+    }
+    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE)
+        std::cerr << "[gs-gpu] incomplete framebuffer 0x" << std::hex << status << std::dec << std::endl;
+    m_fbos.emplace(key, fbo);
+    return fbo;
+}
+
+GSGpuRenderer::Texture *GSGpuRenderer::GetTexture(const GSDrawState &state)
+{
+    const GSTex0Reg &tex0 = state.context.tex0;
+    const uint32_t w = state.textureWidth, h = state.textureHeight;
+    const bool indexed = isIndexedPsm(tex0.psm);
+    const uint64_t texaKey = indexed ? 0u : (static_cast<uint64_t>(state.texa.ta0) | (static_cast<uint64_t>(state.texa.ta1) << 8) |
+                                             (static_cast<uint64_t>(state.texa.aem) << 16));
+    Texture *tex = nullptr;
+    for (auto &t : m_textures)
+        if (t->tbp0 == tex0.tbp0 && t->tbw == tex0.tbw && t->psm == tex0.psm && t->w == w && t->h == h && t->texaKey == texaKey)
+            tex = t.get();
+    if (!tex)
+    {
+        if (m_textures.size() >= 512u)
+        {
+            auto oldest = std::min_element(m_textures.begin(), m_textures.end(),
+                                           [](const auto &a, const auto &b) { return a->lastUse < b->lastUse; });
+            glDeleteTextures(1, &(*oldest)->tex);
+            m_textures.erase(oldest);
+        }
+        auto t = std::make_unique<Texture>();
+        t->tbp0 = tex0.tbp0;
+        t->tbw = tex0.tbw;
+        t->psm = tex0.psm;
+        t->w = w;
+        t->h = h;
+        t->texaKey = texaKey;
+        t->indexed = indexed;
+        pageSize(tex0.psm, t->tileW, t->tileH);
+        t->tilesX = (w + t->tileW - 1u) / t->tileW;
+        t->tilesY = (h + t->tileH - 1u) / t->tileH;
+        t->tileVersion.assign(t->tilesX * t->tilesY, 0u);
+        glGenTextures(1, &t->tex);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, t->tex);
+        if (indexed)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, w, h, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, nullptr);
+        else
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glActiveTexture(GL_TEXTURE0);
+        m_textures.push_back(std::move(t));
+        tex = m_textures.back().get();
+    }
+    tex->lastUse = ++m_useCounter;
+
+    // Render to texture: write back any target drawn over these pages first.
+    uint32_t first, count;
+    pageSpan(tex0.psm, tex0.tbp0, tex0.tbw, 0u, h, first, count);
+    DownloadOverlapping(first, count);
+
+    uint32_t pw, ph;
+    pageSize(tex0.psm, pw, ph);
+    const uint32_t perRow = std::max<uint32_t>(1u, (std::max<uint32_t>(tex0.tbw, 1u) * 64u + pw - 1u) / pw);
+    const bool misaligned = (tex0.tbp0 % 32u) != 0u;
+    bool bound = false;
+    for (uint32_t ty = 0; ty < tex->tilesY; ++ty)
+    {
+        for (uint32_t tx = 0; tx < tex->tilesX; ++tx)
+        {
+            // Pages wrap within the buffer width, so tile (tx, ty) maps to the page grid modulo the row.
+            const uint32_t page = tex0.tbp0 / 32u + ty * perRow + (tx % perRow);
+            const uint64_t version = std::max<uint64_t>(1u, MaxVersion(page, misaligned ? 2u : 1u));
+            uint64_t &have = tex->tileVersion[ty * tex->tilesX + tx];
+            if (have == version)
+                continue;
+            have = version;
+            if (!bound)
+            {
+                // Draws already batched must sample the old contents.
+                if (m_haveKey && m_key.texture == tex->tex)
+                    FlushDraws();
+                glActiveTexture(GL_TEXTURE3);
+                glBindTexture(GL_TEXTURE_2D, tex->tex);
+                bound = true;
+            }
+            const uint32_t x0 = tx * tex->tileW, y0 = ty * tex->tileH;
+            const uint32_t tw = std::min(tex->tileW, w - x0), th = std::min(tex->tileH, h - y0);
+            m_scratch.resize(tw * th);
+            if (tex->indexed)
+            {
+                m_cpu.ReadRect(tex0.psm, tex0.tbp0, tex0.tbw, x0, y0, tw, th, m_scratch.data());
+                std::vector<uint8_t> idx(tw * th);
+                for (uint32_t i = 0; i < tw * th; ++i)
+                    idx[i] = static_cast<uint8_t>(m_scratch[i]);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, tw, th, GL_RED_INTEGER, GL_UNSIGNED_BYTE, idx.data());
+            }
+            else
+            {
+                m_cpu.DecodeTexels(state, x0, y0, tw, th, m_scratch.data());
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, tw, th, GL_RGBA, GL_UNSIGNED_BYTE, m_scratch.data());
+            }
+        }
+    }
+    if (bound)
+        glActiveTexture(GL_TEXTURE0);
+    return tex;
+}
+
+GLuint GSGpuRenderer::GetPalette(const GSDrawState &state)
+{
+    const GSTex0Reg &tex0 = state.context.tex0;
+    const uint64_t texa = static_cast<uint64_t>(state.texa.ta0) | (static_cast<uint64_t>(state.texa.ta1) << 8) |
+                          (static_cast<uint64_t>(state.texa.aem) << 16);
+    const auto key = std::make_tuple(m_cpu.ClutVersion(), static_cast<uint32_t>(tex0.cpsm), static_cast<uint32_t>(tex0.csm),
+                                     static_cast<uint32_t>(tex0.csa), static_cast<uint32_t>(tex0.psm), texa);
+    auto it = m_palettes.find(key);
+    if (it != m_palettes.end())
+        return it->second;
+    if (m_palettes.size() >= 256u)
+    {
+        for (auto &[k, p] : m_palettes)
+            glDeleteTextures(1, &p);
+        m_palettes.clear();
+    }
+    uint32_t entries[256];
+    for (uint32_t i = 0; i < 256u; ++i)
+        entries[i] = m_cpu.PaletteEntry(state, static_cast<uint8_t>(i));
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, entries);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glActiveTexture(GL_TEXTURE0);
+    m_palettes.emplace(key, tex);
+    return tex;
+}
+
+void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
+{
+    const GSDrawState &st = batch.state;
+    const GSContext &ctx = st.context;
+    const uint32_t ztst = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+    if (ztst == 0u)
+        return; // NEVER
+
+    DrawKey key{};
+    key.colorFbp = ctx.frame.fbp;
+    key.colorFbw = std::max<uint32_t>(ctx.frame.fbw, 1u);
+    key.colorPsm = ctx.frame.psm;
+    const bool depthTest = ztst != 1u;
+    const bool depthWrite = !ctx.zbuf.zmask;
+    key.depthMode = depthTest ? (depthWrite ? 2u : 1u) : (depthWrite ? 3u : 0u);
+    key.zbp = key.depthMode ? ctx.zbuf.zbp : 0u;
+    key.zpsm = key.depthMode ? ctx.zbuf.psm : 0u;
+    key.ztst = ztst;
+    key.scissor[0] = ctx.scissor.x0;
+    key.scissor[1] = ctx.scissor.y0;
+    key.scissor[2] = ctx.scissor.x1;
+    key.scissor[3] = ctx.scissor.y1;
+    uint32_t mask = 0;
+    for (uint32_t c = 0; c < 4u; ++c)
+    {
+        const uint32_t byte = (ctx.frame.fbmsk >> (8u * c)) & 0xFFu;
+        if (byte == 0u)
+            mask |= 1u << c;
+        else if (byte != 0xFFu)
+        {
+            mask |= 1u << c;
+            ++unsupported;
+        }
+    }
+    if (ctx.frame.psm == GS_PSM_CT24)
+        mask &= 7u;
+    key.colorMask = mask;
+    key.abe = st.prim.abe ? 1u : 0u;
+    key.alpha = st.prim.abe ? ctx.alpha : 0u;
+    key.colclamp = static_cast<uint32_t>(st.colclamp & 1u);
+    key.fba = static_cast<uint32_t>(ctx.fba & 1u);
+    key.tme = st.prim.tme ? 1u : 0u;
+    key.fst = st.prim.fst ? 1u : 0u;
+    key.sprite = st.prim.type == GS_PRIM_SPRITE ? 1u : 0u;
+    key.fge = st.prim.fge ? 1u : 0u;
+    key.fogColor = static_cast<uint32_t>(st.fogR) | (static_cast<uint32_t>(st.fogG) << 8) | (static_cast<uint32_t>(st.fogB) << 16);
+    key.ate = static_cast<uint32_t>(ctx.test & 1u);
+    key.atst = static_cast<uint32_t>((ctx.test >> 1) & 7u);
+    key.aref = static_cast<uint32_t>((ctx.test >> 4) & 0xFFu);
+    if (key.ate && ((ctx.test >> 12) & 3u) != 0u)
+        ++unsupported; // AFAIL other than KEEP
+    if ((ctx.test >> 14) & 1u)
+        ++unsupported; // DATE
+    if (st.pabe)
+        ++unsupported;
+
+    Texture *texture = nullptr;
+    if (st.prim.tme)
+    {
+        texture = GetTexture(st);
+        key.texture = texture->tex;
+        key.indexed = texture->indexed ? 1u : 0u;
+        key.palette = texture->indexed ? GetPalette(st) : 0u;
+        key.texW = st.textureWidth;
+        key.texH = st.textureHeight;
+        key.linear = st.linearFilter ? 1u : 0u;
+        key.tfx = ctx.tex0.tfx;
+        key.tcc = ctx.tex0.tcc;
+        key.clamp = ctx.clamp;
+    }
+
+    // Size the targets to what the scissor allows to be drawn.
+    const uint32_t height = static_cast<uint32_t>(ctx.scissor.y1) + 1u;
+    if (!m_haveKey || !(key == m_key))
+    {
+        FlushDraws();
+        Target *depth = key.depthMode ? FindOrCreateTarget(key.zbp, key.colorFbw, key.zpsm, true, height) : nullptr;
+        Target *color = (mask != 0u) ? FindOrCreateTarget(key.colorFbp, key.colorFbw, key.colorPsm, false, height) : nullptr;
+        if (depth && std::none_of(m_targets.begin(), m_targets.end(), [&](const auto &t) { return t.get() == depth; }))
+        {
+            ++unsupported; // colour and depth buffers share pages
+            return;
+        }
+        if (color && color->vramNewer)
+            UploadTarget(*color);
+        if (depth && depth->vramNewer)
+            UploadTarget(*depth);
+        // Creating the depth target may have retired the colour one (same pages) and vice versa.
+        if (!color && !depth)
+            return;
+        m_key = key;
+        m_haveKey = true;
+        m_keyColor = color;
+        m_keyDepth = depth;
+        ApplyKey(key, color, depth);
+    }
+
+    const int ofx = ctx.xyoffset.ofx >> 4;
+    const int ofy = ctx.xyoffset.ofy >> 4;
+    auto makeVertex = [&](const GSVertex &v, const GSVertex &colorFrom, bool zconst, float zvalue)
+    {
+        Vertex out{};
+        out.x = v.x - static_cast<float>(ofx);
+        out.y = v.y - static_cast<float>(ofy);
+        out.z = zvalue;
+        const GSVertex &c = st.prim.iip ? v : colorFrom;
+        out.r = c.r;
+        out.g = c.g;
+        out.b = c.b;
+        out.a = c.a;
+        if (st.prim.fst)
+        {
+            out.s = static_cast<float>(v.u);
+            out.t = static_cast<float>(v.v);
+            out.q = 1.0f;
+        }
+        else
+        {
+            out.s = v.s;
+            out.t = v.t;
+            out.q = v.q;
+        }
+        out.fog = v.fog;
+        out.zconst = zconst ? 1.0f : 0.0f;
+        return out;
+    };
+
+    switch (st.prim.type)
+    {
+    case GS_PRIM_SPRITE:
+    {
+        const GSVertex &v0 = batch.vertices[0];
+        const GSVertex &v1 = batch.vertices[1];
+        // GSCpuBackend::DrawSprite: integer corners, colour/Z/fog of the second vertex,
+        // texture coordinates linear across the rectangle.
+        float x0 = std::trunc(v0.x) - static_cast<float>(ofx), y0 = std::trunc(v0.y) - static_cast<float>(ofy);
+        float x1 = std::trunc(v1.x) - static_cast<float>(ofx), y1 = std::trunc(v1.y) - static_cast<float>(ofy);
+        float s0, t0, s1, t1;
+        if (st.prim.fst)
+        {
+            s0 = static_cast<float>(v0.u >> 4) * 16.0f;
+            t0 = static_cast<float>(v0.v >> 4) * 16.0f;
+            s1 = static_cast<float>(v1.u >> 4) * 16.0f;
+            t1 = static_cast<float>(v1.v >> 4) * 16.0f;
+        }
+        else
+        {
+            const float q0 = std::fabs(v0.q) > 1.0e-8f ? v0.q : 1.0f;
+            const float q1 = std::fabs(v1.q) > 1.0e-8f ? v1.q : 1.0f;
+            s0 = v0.s / q0, t0 = v0.t / q0, s1 = v1.s / q1, t1 = v1.t / q1;
+        }
+        if (x0 > x1)
+        {
+            std::swap(x0, x1);
+            std::swap(s0, s1);
+        }
+        if (y0 > y1)
+        {
+            std::swap(y0, y1);
+            std::swap(t0, t1);
+        }
+        if (x1 - x0 < 1.0f)
+            x1 = x0 + 1.0f;
+        if (y1 - y0 < 1.0f)
+            y1 = y0 + 1.0f;
+        const float z = static_cast<float>(static_cast<double>(static_cast<uint32_t>(v1.z)) * kDepthScale);
+        Vertex corner{};
+        corner.z = z;
+        corner.r = v1.r, corner.g = v1.g, corner.b = v1.b, corner.a = v1.a;
+        corner.q = 1.0f;
+        corner.fog = v1.fog;
+        corner.zconst = 1.0f;
+        auto at = [&](float x, float y, float s, float t)
+        {
+            Vertex v = corner;
+            v.x = x, v.y = y, v.s = s, v.t = t;
+            m_vertices.push_back(v);
+        };
+        at(x0, y0, s0, t0);
+        at(x1, y0, s1, t0);
+        at(x0, y1, s0, t1);
+        at(x1, y0, s1, t0);
+        at(x1, y1, s1, t1);
+        at(x0, y1, s0, t1);
+        break;
+    }
+    case GS_PRIM_TRIANGLE:
+    case GS_PRIM_TRISTRIP:
+    case GS_PRIM_TRIFAN:
+    {
+        const GSVertex &v0 = batch.vertices[0], &v1 = batch.vertices[1], &v2 = batch.vertices[2];
+        const bool zconst = v0.z == v1.z && v1.z == v2.z;
+        auto depthOf = [](const GSVertex &v)
+        { return static_cast<float>(std::floor(v.z + 0.5) * kDepthScale); };
+        m_vertices.push_back(makeVertex(v0, v2, zconst, depthOf(v0)));
+        m_vertices.push_back(makeVertex(v1, v2, zconst, depthOf(v1)));
+        m_vertices.push_back(makeVertex(v2, v2, zconst, depthOf(v2)));
+        break;
+    }
+    default:
+        ++unsupported; // points and lines are not drawn yet
+        break;
+    }
+}
+
+void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
+{
+    const uint32_t width = color ? color->width : depth->width;
+    const uint32_t height = color ? color->height : depth->height;
+    glBindFramebuffer(GL_FRAMEBUFFER, FramebufferFor(color, depth));
+    glViewport(0, 0, width, height);
+    glEnable(GL_SCISSOR_TEST);
+    const uint32_t sx0 = std::min(key.scissor[0], width), sy0 = std::min(key.scissor[1], height);
+    const uint32_t sx1 = std::min(key.scissor[2] + 1u, width), sy1 = std::min(key.scissor[3] + 1u, height);
+    glScissor(sx0, sy0, sx1 > sx0 ? sx1 - sx0 : 0, sy1 > sy0 ? sy1 - sy0 : 0);
+    glColorMask(color && (key.colorMask & 1u), color && (key.colorMask & 2u), color && (key.colorMask & 4u),
+                color && (key.colorMask & 8u));
+    if (depth)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(key.ztst == 1u ? GL_ALWAYS : key.ztst == 2u ? GL_GEQUAL : GL_GREATER);
+        glDepthMask((key.depthMode == 2u || key.depthMode == 3u) ? GL_TRUE : GL_FALSE);
+    }
+    else
+    {
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+    }
+
+    glUseProgram(m_program);
+    glUniform2f(U("uTargetSize"), static_cast<float>(width), static_cast<float>(height));
+    glUniform1i(U("uTme"), static_cast<GLint>(key.tme));
+    glUniform1i(U("uIndexed"), static_cast<GLint>(key.indexed));
+    glUniform1i(U("uFst"), static_cast<GLint>(key.fst));
+    glUniform1i(U("uSprite"), static_cast<GLint>(key.sprite));
+    glUniform1i(U("uLinear"), static_cast<GLint>(key.linear));
+    glUniform2i(U("uTexSize"), static_cast<GLint>(std::max<uint32_t>(key.texW, 1u)), static_cast<GLint>(std::max<uint32_t>(key.texH, 1u)));
+    glUniform2i(U("uWrapMode"), static_cast<GLint>(key.clamp & 3u), static_cast<GLint>((key.clamp >> 2) & 3u));
+    glUniform4i(U("uRegion"), static_cast<GLint>((key.clamp >> 4) & 0x3FFu), static_cast<GLint>((key.clamp >> 14) & 0x3FFu),
+                static_cast<GLint>((key.clamp >> 24) & 0x3FFu), static_cast<GLint>((key.clamp >> 34) & 0x3FFu));
+    glUniform1i(U("uTfx"), static_cast<GLint>(key.tfx));
+    glUniform1i(U("uTcc"), static_cast<GLint>(key.tcc));
+    glUniform1i(U("uFge"), static_cast<GLint>(key.fge));
+    glUniform3f(U("uFogColor"), static_cast<float>(key.fogColor & 0xFFu), static_cast<float>((key.fogColor >> 8) & 0xFFu),
+                static_cast<float>((key.fogColor >> 16) & 0xFFu));
+    glUniform1i(U("uAte"), static_cast<GLint>(key.ate));
+    glUniform1i(U("uAtst"), static_cast<GLint>(key.atst));
+    glUniform1f(U("uAref"), static_cast<float>(key.aref));
+    glUniform1i(U("uFba"), static_cast<GLint>(key.fba));
+    glUniform1i(U("uIndexTex"), 0);
+    glUniform1i(U("uRgbaTex"), 1);
+    glUniform1i(U("uPalette"), 2);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, key.indexed ? key.texture : 0u);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, key.indexed ? 0u : key.texture);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, key.palette);
+    glActiveTexture(GL_TEXTURE0);
+
+    // Blending: (A - B) * C / 128 + D with A, B, D in {Cs, Cd, 0} and C in {As, Ad, FIX}, as
+    // cs * Cs + cd * Cd. The shader outputs Cs * |cs| and the blend factor f = C / 128; GL applies
+    // the sign (equation) and |cd| (destination factor).
+    if (!key.abe)
+    {
+        glDisable(GL_BLEND);
+        glUniform1i(U("uSrcScaleMode"), 0);
+        glUniform1i(U("uBlendC"), 0);
+        glUniform1f(U("uBlendFix"), 128.0f);
+        return;
+    }
+    const uint32_t a = key.alpha & 3u, b = (key.alpha >> 2) & 3u, c = (key.alpha >> 4) & 3u, d = (key.alpha >> 6) & 3u;
+    const float fix = static_cast<float>((key.alpha >> 32) & 0xFFu);
+    if (c == 1u)
+        ++unsupported; // destination alpha as the factor
+    // Coefficients in terms of f: value = k0 + k1 * f.
+    auto coeff = [&](uint32_t which, int &k0, int &k1)
+    {
+        k0 = (d == which) ? 1 : 0;
+        k1 = (a == which ? 1 : 0) - (b == which ? 1 : 0);
+    };
+    int s0, s1, d0, d1;
+    coeff(0u, s0, s1);
+    coeff(1u, d0, d1);
+    // Source scale mode from (s0, s1): 1, f, 1-f, 1+f, or their negations.
+    int srcSign = 1, srcMode = 0;
+    if (s0 == 0 && s1 == 0)
+        srcMode = -1;
+    else if (s0 == 1 && s1 == 0)
+        srcMode = 0;
+    else if (s0 == 0)
+        srcMode = 1, srcSign = s1;
+    else if (s1 == -1)
+        srcMode = 2;
+    else
+        srcMode = 3;
+    int dstSign = 1;
+    GLenum dstFactor = GL_ZERO;
+    if (d0 == 0 && d1 == 0)
+        dstFactor = GL_ZERO;
+    else if (d0 == 1 && d1 == 0)
+        dstFactor = GL_ONE;
+    else if (d0 == 0)
+        dstFactor = GL_SRC1_ALPHA, dstSign = d1;
+    else if (d1 == -1)
+        dstFactor = GL_ONE_MINUS_SRC1_ALPHA;
+    else
+    {
+        dstFactor = GL_ONE; // 1 + f cannot be expressed
+        ++unsupported;
+    }
+    GLenum equation = GL_FUNC_ADD;
+    GLenum srcFactor = srcMode < 0 ? GL_ZERO : GL_ONE;
+    if (srcSign < 0 && dstSign > 0)
+        equation = GL_FUNC_REVERSE_SUBTRACT; // dst - src
+    else if (srcSign > 0 && dstSign < 0)
+        equation = GL_FUNC_SUBTRACT;         // src - dst
+    else if (srcSign < 0 && dstSign < 0)
+    {
+        srcFactor = GL_ZERO; // everything negative clamps to 0
+        dstFactor = GL_ZERO;
+    }
+    glEnable(GL_BLEND);
+    glBlendEquationSeparate(equation, GL_FUNC_ADD);
+    glBlendFuncSeparate(srcFactor, dstFactor, GL_ONE, GL_ZERO);
+    glUniform1i(U("uSrcScaleMode"), srcMode < 0 ? 0 : srcMode);
+    glUniform1i(U("uBlendC"), static_cast<GLint>(c));
+    glUniform1f(U("uBlendFix"), fix);
+}
+
+void GSGpuRenderer::FlushDraws()
+{
+    if (m_vertices.empty())
+        return;
+    glBindVertexArray(m_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_vertices.size() * sizeof(Vertex)), m_vertices.data(), GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_vertices.size()));
+    glBindVertexArray(0);
+    if (m_keyColor)
+        m_keyColor->gpuNewer = true;
+    if (m_keyDepth && (m_key.depthMode == 2u || m_key.depthMode == 3u))
+        m_keyDepth->gpuNewer = true;
+    m_vertices.clear();
+}
+
+// ---------------------------------------------------------------------------------------------------
+// GSGpuBackend: command queue (guest thread) and execution (host thread)
+// ---------------------------------------------------------------------------------------------------
+
+namespace
+{
+    bool envFlag(const char *name)
+    {
+        const char *v = std::getenv(name);
+        return v && *v && std::strcmp(v, "0") != 0;
+    }
+
+    struct VerifyStats
+    {
+        uint64_t frames = 0, badFrames = 0;
+        double sumMeanAbs = 0.0;
+        std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    } g_verify;
+}
+
+bool GSGpuBackend::Requested()
+{
+    const char *v = std::getenv("PS2X_GS_BACKEND");
+    return v && std::strcmp(v, "gpu") == 0;
+}
+
+GSGpuBackend::GSGpuBackend()
+{
+    m_renderer = std::make_unique<GSGpuRenderer>(m_cpu);
+    if (envFlag("PS2X_GS_GPU_VERIFY"))
+    {
+        m_shadow = std::make_unique<GSCpuBackend>();
+        std::cerr << "[gs-gpu] verifying against the CPU rasterizer (PS2X_GS_GPU_VERIFY)" << std::endl;
+    }
+    std::cerr << "[gs-gpu] GPU GS backend selected (PS2X_GS_BACKEND=gpu)" << std::endl;
+}
+
+GSGpuBackend::~GSGpuBackend() = default;
+
+bool GSGpuBackend::OnHostThread() const
+{
+    return !m_hostStarted.load(std::memory_order_acquire) || std::this_thread::get_id() == m_hostThread;
+}
+
+void GSGpuBackend::PublishLocked()
+{
+    if (m_pending.empty())
+        return;
+    m_ready.push_back(std::move(m_pending));
+    m_pending.clear();
+    m_pending.reserve(1024);
+    m_workCv.notify_one();
+}
+
+void GSGpuBackend::Enqueue(Command &&command)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const bool publish = command.type != CommandType::Submit;
+    m_pending.push_back(std::move(command));
+    ++m_queued;
+    if (publish || m_pending.size() >= 512u)
+        PublishLocked();
+}
+
+void GSGpuBackend::RunOnHost(const std::function<void()> &fn) const
+{
+    auto *self = const_cast<GSGpuBackend *>(this);
+    if (!m_hostStarted.load(std::memory_order_acquire))
+    {
+        // Start-up, before the host loop runs: nothing is queued yet, so run in place.
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_queued == m_completed && m_pending.empty())
+        {
+            lock.unlock();
+            fn();
+            return;
+        }
+    }
+    if (std::this_thread::get_id() == m_hostThread)
+    {
+        // Drain everything queued so far in order, then run.
+        for (;;)
+        {
+            std::vector<Command> batch;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                self->PublishLocked();
+                if (m_ready.empty())
+                    break;
+                batch = std::move(m_ready.front());
+                m_ready.pop_front();
+            }
+            self->ExecuteBatch(batch);
+        }
+        fn();
+        return;
+    }
+    std::unique_lock<std::mutex> lock(m_mutex);
+    if (m_stopped)
+        return;
+    Command command;
+    command.type = CommandType::Call;
+    command.call = fn;
+    self->m_pending.push_back(std::move(command));
+    const uint64_t target = ++self->m_queued;
+    self->PublishLocked();
+    m_doneCv.wait(lock, [&]() { return m_completed >= target || m_stopped; });
+}
+
+void GSGpuBackend::ExecuteBatch(std::vector<Command> &commands)
+{
+    for (Command &command : commands)
+        Execute(command);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_completed += commands.size();
+    }
+    m_doneCv.notify_all();
+}
+
+void GSGpuBackend::PumpHostThread(std::chrono::steady_clock::time_point deadline)
+{
+    if (!m_hostStarted.load(std::memory_order_acquire))
+    {
+        m_hostThread = std::this_thread::get_id();
+        m_hostStarted.store(true, std::memory_order_release);
+    }
+    m_renderer->BeginHostWork();
+    for (;;)
+    {
+        std::vector<Command> batch;
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (m_stopped)
+                break;
+            if (m_ready.empty())
+                m_workCv.wait_until(lock, deadline, [&]() { return !m_ready.empty() || m_stopped; });
+            if (m_ready.empty() || m_stopped)
+                break;
+            batch = std::move(m_ready.front());
+            m_ready.pop_front();
+        }
+        ExecuteBatch(batch);
+        if (std::chrono::steady_clock::now() >= deadline)
+            break;
+    }
+    m_renderer->EndHostWork();
+}
+
+void GSGpuBackend::ShutdownHostThread()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_stopped = true;
+    }
+    m_doneCv.notify_all();
+    m_workCv.notify_all();
+    m_renderer->Release();
+}
+
+void GSGpuBackend::Execute(Command &command)
+{
+    GSGpuRenderer &r = *m_renderer;
+    switch (command.type)
+    {
+    case CommandType::Submit:
+        r.Draw(command.batch);
+        if (m_shadow)
+            m_shadow->Submit(command.batch);
+        break;
+    case CommandType::LoadClut:
+    {
+        uint32_t first, count;
+        pageSpan(command.tex0.cpsm, command.tex0.cbp, 1u, 0u, 16u, first, count);
+        r.DownloadOverlapping(first, count);
+        m_cpu.LoadClut(command.tex0, command.texclut);
+        if (m_shadow)
+            m_shadow->LoadClut(command.tex0, command.texclut);
+        break;
+    }
+    case CommandType::BeginTransfer:
+    {
+        const GSTransferCommand &t = command.transfer;
+        r.FlushDraws();
+        if (t.direction == 1u || t.direction == 2u)
+        {
+            uint32_t first, count;
+            pageSpan(t.bitbltbuf.spsm, t.bitbltbuf.sbp, t.bitbltbuf.sbw, t.trxpos.ssay, t.trxreg.rrh, first, count);
+            r.DownloadOverlapping(first, count);
+        }
+        uint32_t first, count;
+        pageSpan(t.bitbltbuf.dpsm, t.bitbltbuf.dbp, t.bitbltbuf.dbw, t.trxpos.dsay, t.trxreg.rrh, first, count);
+        if (t.direction == 0u || t.direction == 2u)
+            r.DownloadOverlapping(first, count); // partial writes keep the rest of the pages
+        m_cpu.BeginTransfer(t);
+        if (t.direction == 2u)
+            r.InvalidatePages(first, count);
+        command.args[0] = first;
+        command.args[1] = count;
+        m_transferFirstPage = first;
+        m_transferPageCount = count;
+        if (m_shadow)
+            m_shadow->BeginTransfer(t);
+        break;
+    }
+    case CommandType::UploadImage:
+        m_cpu.UploadImage(command.data.data(), static_cast<uint32_t>(command.data.size()));
+        r.InvalidatePages(m_transferFirstPage, m_transferPageCount);
+        if (m_shadow)
+            m_shadow->UploadImage(command.data.data(), static_cast<uint32_t>(command.data.size()));
+        break;
+    case CommandType::TextureFlush:
+        m_cpu.TextureFlush();
+        if (m_shadow)
+            m_shadow->TextureFlush();
+        break;
+    case CommandType::WriteVram:
+    {
+        r.DownloadAll();
+        m_cpu.WriteVram(command.args[0], command.args[1], command.args[2], command.args[3], command.args[4], command.args[5]);
+        r.InvalidateAll();
+        if (m_shadow)
+            m_shadow->WriteVram(command.args[0], command.args[1], command.args[2], command.args[3], command.args[4], command.args[5]);
+        break;
+    }
+    case CommandType::Present:
+    {
+        r.DownloadAll();
+        PresentationFrame frame = m_cpu.Present(command.presentRequest);
+        if (m_shadow)
+        {
+            PresentationFrame reference = m_shadow->Present(command.presentRequest);
+            if (frame && reference && frame.width == reference.width && frame.height == reference.height)
+            {
+                uint64_t sum = 0, bad = 0;
+                const size_t n = std::min(frame.pixels.size(), reference.pixels.size());
+                for (size_t i = 0; i < n; ++i)
+                {
+                    if ((i & 3u) == 3u)
+                        continue;
+                    const int d = std::abs(static_cast<int>(frame.pixels[i]) - static_cast<int>(reference.pixels[i]));
+                    sum += static_cast<uint64_t>(d);
+                    bad += d > 16 ? 1u : 0u;
+                }
+                const double meanAbs = static_cast<double>(sum) / static_cast<double>(std::max<size_t>(1u, n / 4u * 3u));
+                ++g_verify.frames;
+                g_verify.sumMeanAbs += meanAbs;
+                if (bad > n / 400u)
+                    ++g_verify.badFrames;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - g_verify.lastReport > std::chrono::seconds(5))
+                {
+                    g_verify.lastReport = now;
+                    std::cerr << "[gs-gpu-verify] frames=" << g_verify.frames << " mean|diff|="
+                              << (g_verify.sumMeanAbs / static_cast<double>(g_verify.frames)) << " frames>0.25%bad="
+                              << g_verify.badFrames << " last=" << meanAbs << " unsupported=" << r.unsupported << std::endl;
+                    static const char *dumpDir = std::getenv("PS2X_DUMP_FRAMES");
+                    if (dumpDir && *dumpDir)
+                    {
+                        // Side by side: GPU | CPU | amplified difference, as a binary PPM.
+                        char path[512];
+                        std::snprintf(path, sizeof(path), "%s/gpu_verify_%06llu.ppm", dumpDir,
+                                      static_cast<unsigned long long>(command.presentRequest.vsyncTick));
+                        if (FILE *f = std::fopen(path, "wb"))
+                        {
+                            std::fprintf(f, "P6\n%u %u\n255\n", frame.width * 3u, frame.height);
+                            for (uint32_t y = 0; y < frame.height; ++y)
+                                for (uint32_t part = 0; part < 3u; ++part)
+                                    for (uint32_t x = 0; x < frame.width; ++x)
+                                    {
+                                        const size_t o = (static_cast<size_t>(y) * frame.width + x) * 4u;
+                                        for (uint32_t c = 0; c < 3u; ++c)
+                                        {
+                                            int v = part == 0 ? frame.pixels[o + c] : part == 1 ? reference.pixels[o + c]
+                                                                                             : std::min(255, 8 * std::abs(int(frame.pixels[o + c]) - int(reference.pixels[o + c])));
+                                            std::fputc(v, f);
+                                        }
+                                    }
+                            std::fclose(f);
+                        }
+                    }
+                }
+            }
+        }
+        m_presentPending.store(false, std::memory_order_release);
+        if (command.presentCallback)
+            command.presentCallback(std::move(frame));
+        break;
+    }
+    case CommandType::Call:
+        if (command.call)
+            command.call();
+        break;
+    }
+}
+
+void GSGpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+{
+    m_vram = vram;
+    m_vramSize = vramSize;
+    m_cpu.Initialize(vram, vramSize);
+    if (m_shadow)
+    {
+        m_shadowVram.assign(vram, vram + vramSize);
+        m_shadow->Initialize(m_shadowVram.data(), vramSize);
+    }
+}
+
+void GSGpuBackend::Reset()
+{
+    RunOnHost([this]()
+              {
+                  m_renderer->Reset();
+                  m_cpu.Reset();
+                  if (m_shadow)
+                  {
+                      m_shadow->Reset();
+                      if (m_vram)
+                          std::memcpy(m_shadowVram.data(), m_vram, std::min<size_t>(m_shadowVram.size(), m_vramSize));
+                  } });
+}
+
+void GSGpuBackend::Submit(const GSPrimitiveBatch &batch)
+{
+    Command command;
+    command.type = CommandType::Submit;
+    command.batch = batch;
+    Enqueue(std::move(command));
+}
+
+void GSGpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+{
+    Command command;
+    command.type = CommandType::LoadClut;
+    command.tex0 = tex0;
+    command.texclut = texclut;
+    Enqueue(std::move(command));
+}
+
+void GSGpuBackend::BeginTransfer(const GSTransferCommand &transferCommand)
+{
+    Command command;
+    command.type = CommandType::BeginTransfer;
+    command.transfer = transferCommand;
+    Enqueue(std::move(command));
+}
+
+void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+{
+    Command command;
+    command.type = CommandType::UploadImage;
+    command.data.assign(data, data + sizeBytes);
+    Enqueue(std::move(command));
+}
+
+void GSGpuBackend::Flush()
+{
+}
+
+void GSGpuBackend::TextureFlush()
+{
+    Command command;
+    command.type = CommandType::TextureFlush;
+    Enqueue(std::move(command));
+}
+
+void GSGpuBackend::Sync(GSSyncReason reason)
+{
+    if (reason == GSSyncReason::Finish)
+        return;
+    RunOnHost([this, reason]()
+              {
+                  m_renderer->DownloadAll();
+                  m_cpu.Sync(reason); });
+}
+
+PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
+{
+    PresentationFrame frame;
+    RunOnHost([&]()
+              {
+                  m_renderer->DownloadAll();
+                  frame = m_cpu.Present(request); });
+    return frame;
+}
+
+bool GSGpuBackend::PresentAsync(const GSPresentationRequest &request, PresentCallback callback)
+{
+    if (m_presentPending.exchange(true, std::memory_order_acq_rel))
+        return false;
+    Command command;
+    command.type = CommandType::Present;
+    command.presentRequest = request;
+    command.presentCallback = std::move(callback);
+    Enqueue(std::move(command));
+    return true;
+}
+
+bool GSGpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+{
+    bool result = false;
+    RunOnHost([&]()
+              {
+                  m_renderer->DownloadAll();
+                  result = m_cpu.ClearFramebuffer(context, rgba);
+                  m_renderer->InvalidateAll();
+                  if (m_shadow)
+                      m_shadow->ClearFramebuffer(context, rgba); });
+    return result;
+}
+
+uint32_t GSGpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+{
+    uint32_t result = 0;
+    RunOnHost([&]()
+              {
+                  result = m_cpu.ConsumeLocalToHostBytes(dst, maxBytes);
+                  if (m_shadow)
+                  {
+                      std::vector<uint8_t> discard(maxBytes);
+                      m_shadow->ConsumeLocalToHostBytes(discard.data(), maxBytes);
+                  } });
+    return result;
+}
+
+uint32_t GSGpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+{
+    uint32_t result = 0;
+    RunOnHost([&]()
+              {
+                  m_renderer->DownloadAll();
+                  result = m_cpu.ReadVram(psm, base, bw, x, y); });
+    return result;
+}
+
+void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+{
+    Command command;
+    command.type = CommandType::WriteVram;
+    command.args[0] = psm;
+    command.args[1] = base;
+    command.args[2] = bw;
+    command.args[3] = x;
+    command.args[4] = y;
+    command.args[5] = value;
+    Enqueue(std::move(command));
+}
+
+void GSGpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+{
+    RunOnHost([&]()
+              {
+                  m_renderer->DownloadAll();
+                  m_cpu.SnapshotVram(out); });
+}
+
+GSTransferSnapshot GSGpuBackend::GetTransferSnapshot() const
+{
+    GSTransferSnapshot result{};
+    RunOnHost([&]()
+              { result = m_cpu.GetTransferSnapshot(); });
+    return result;
+}

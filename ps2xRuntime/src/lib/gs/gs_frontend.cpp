@@ -18,12 +18,15 @@
 #include <vector>
 
 #include "gs_threaded_backend.h"
+#include "gs_gpu_backend.h"
 
 namespace
 {
     // The CPU rasterizer, split across PS2X_GS_THREADS worker threads (0 = run it inline).
     std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend()
     {
+        if (GSGpuBackend::Requested())
+            return std::make_unique<GSGpuBackend>();
         const uint32_t workers = GSThreadedBackend::ConfiguredWorkers();
         if (workers == 0u)
             return std::make_unique<GSCpuBackend>();
@@ -872,13 +875,13 @@ void GS::latchHostPresentationFrame()
 
     {
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
-        if (auto *threaded = dynamic_cast<GSThreadedBackend *>(m_backend.get()))
+        if (m_backend && m_backend->SupportsAsyncPresent())
         {
             // The frame is built behind the queued draws while the guest keeps running; if the
             // previous one is still pending, the host keeps showing the last frame.
             const uint64_t vsyncTick = request.vsyncTick;
-            threaded->PresentAsync(request, [publish, vsyncTick](PresentationFrame &&frame) mutable
-                                   { publish(std::move(frame), vsyncTick); });
+            m_backend->PresentAsync(request, [publish, vsyncTick](PresentationFrame &&frame) mutable
+                                    { publish(std::move(frame), vsyncTick); });
             recordPublishedFrame();
             return;
         }
@@ -1975,6 +1978,11 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+}
+
+GSGpuBackend *GS::gpuBackend()
+{
+    return dynamic_cast<GSGpuBackend *>(m_backend.get());
 }
 
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
