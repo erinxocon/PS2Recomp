@@ -26,7 +26,8 @@ struct VU1Lifted
         kLiftNotLifted = 0,
         kLiftEnd = 1,     // E bit: the program finished
         kLiftHandoff = 2, // continue in the interpreter at m_state.pc (unknown JR / patch target)
-        kLiftYield = 3    // cycle budget used up, like the interpreter's run() returning early
+        kLiftYield = 3,   // cycle budget used up, like the interpreter's run() returning early
+        kLiftContinue = 4 // runNative: continue the lifted program at m_state.pc
     };
 
     struct LiftedRun
@@ -58,7 +59,8 @@ struct VU1Lifted
     struct Snapshot;
 
     static int runProgram(VU1Interpreter &vu, LiftedRun &run, uint32_t startPc);
-    // ps2_vu1_native.cpp: entry 0x1B68 in plain C++; kLiftEnd, or kLiftNotLifted with nothing changed.
+    // ps2_vu1_native.cpp: entry 0x1B68 in plain C++; kLiftEnd, kLiftContinue (the lifted program
+    // takes over at m_state.pc), or kLiftNotLifted with nothing changed.
     static int runNative(VU1Interpreter &vu, LiftedRun &run);
     static int runLifted(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
                          uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t maxCycles);
