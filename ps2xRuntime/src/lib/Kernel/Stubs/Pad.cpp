@@ -308,7 +308,20 @@ namespace ps2_stubs
             {
                 return;
             }
-            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+            // PS2X_INPUT_CLOCK=reads counts the game's pad reads instead of vblanks: the game reads the
+            // pad once per frame, so scripts keep pace with it when it runs slower than real time
+            // (the verifiers), where vblank ticks follow the wall clock and presses land too early.
+            static const bool s_readClock = []()
+            {
+                const char *clock = std::getenv("PS2X_INPUT_CLOCK");
+                return clock && std::string(clock) == "reads";
+            }();
+            static uint64_t s_reads = 0;
+            const uint64_t tick = s_readClock ? s_reads++ : runtime->eeScheduler().currentVSyncTick();
+            static const bool s_traceClock = std::getenv("PS2X_TRACE_PAD") != nullptr;
+            if (s_traceClock && (tick % 600u) == 0u)
+                std::cout << "[pad] input clock " << tick << " at vblank " << runtime->eeScheduler().currentVSyncTick()
+                          << std::endl;
             for (const ScriptedPress &press : scriptedPresses())
                 applyPress(state, press, tick);
             for (const ScriptedPress &press : livePresses(tick))
