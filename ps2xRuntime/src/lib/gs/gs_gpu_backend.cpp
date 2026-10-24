@@ -1729,6 +1729,13 @@ namespace
         return v && *v && std::strcmp(v, "0") != 0;
     }
 
+    struct HostStats
+    {
+        std::atomic<uint64_t> backpressureWaits{0}, presentsDropped{0}, presents{0};
+        double pumpSeconds = 0.0, outsideSeconds = 0.0;
+        std::chrono::steady_clock::time_point lastPumpEnd{};
+    } g_host;
+
     struct VerifyStats
     {
         uint64_t frames = 0, badFrames = 0;
@@ -1781,7 +1788,10 @@ void GSGpuBackend::Enqueue(Command &&command)
     {
         PublishLocked();
         if (m_ready.size() > kMaxReadyBatches && m_hostStarted.load(std::memory_order_acquire) && !OnHostThread())
+        {
+            g_host.backpressureWaits.fetch_add(1, std::memory_order_relaxed);
             m_doneCv.wait(lock, [&]() { return m_ready.size() <= kMaxReadyBatches / 2u || m_stopped; });
+        }
     }
 }
 
@@ -1849,6 +1859,9 @@ void GSGpuBackend::PumpHostThread(std::chrono::steady_clock::time_point deadline
         m_hostThread = std::this_thread::get_id();
         m_hostStarted.store(true, std::memory_order_release);
     }
+    const auto pumpStart = std::chrono::steady_clock::now();
+    if (g_host.lastPumpEnd.time_since_epoch().count() != 0)
+        g_host.outsideSeconds += std::chrono::duration<double>(pumpStart - g_host.lastPumpEnd).count();
     m_renderer->BeginHostWork();
     for (;;)
     {
@@ -1869,12 +1882,16 @@ void GSGpuBackend::PumpHostThread(std::chrono::steady_clock::time_point deadline
             break;
     }
     m_renderer->EndHostWork();
+    g_host.lastPumpEnd = std::chrono::steady_clock::now();
+    g_host.pumpSeconds += std::chrono::duration<double>(g_host.lastPumpEnd - pumpStart).count();
     static auto s_lastSummary = std::chrono::steady_clock::now();
     static const bool s_stats = envFlag("PS2X_GS_GPU_STATS");
     if (s_stats && std::chrono::steady_clock::now() - s_lastSummary > std::chrono::seconds(10))
     {
         s_lastSummary = std::chrono::steady_clock::now();
-        std::cerr << "[gs-gpu] counts:" << m_renderer->UnsupportedSummary() << std::endl;
+        std::cerr << "[gs-gpu] counts:" << m_renderer->UnsupportedSummary() << " | host: pump " << g_host.pumpSeconds << "s outside "
+                  << g_host.outsideSeconds << "s, presents " << g_host.presents.load() << " dropped " << g_host.presentsDropped.load()
+                  << ", guest waits " << g_host.backpressureWaits.load() << std::endl;
     }
 }
 
@@ -2010,7 +2027,12 @@ void GSGpuBackend::Execute(Command &command)
                 }();
                 const bool dumpThis = s_dumpTick >= 0 && command.extra->presentRequest.vsyncTick >= static_cast<uint64_t>(s_dumpTick) &&
                                       command.extra->presentRequest.vsyncTick < static_cast<uint64_t>(s_dumpTick) + 4u;
-                if (dumpThis || now - g_verify.lastReport > std::chrono::seconds(5))
+                const bool badFrame = bad > n / 400u;
+                static uint32_t s_badDumps = 0;
+                const bool dumpBad = badFrame && s_badDumps < 12u;
+                if (dumpBad)
+                    ++s_badDumps;
+                if (dumpThis || dumpBad || now - g_verify.lastReport > std::chrono::seconds(5))
                 {
                     g_verify.lastReport = now;
                     std::cerr << "[gs-gpu-verify] frames=" << g_verify.frames << " mean|diff|="
@@ -2153,7 +2175,11 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
 bool GSGpuBackend::PresentAsync(const GSPresentationRequest &request, PresentCallback callback)
 {
     if (m_presentPending.exchange(true, std::memory_order_acq_rel))
+    {
+        g_host.presentsDropped.fetch_add(1, std::memory_order_relaxed);
         return false;
+    }
+    g_host.presents.fetch_add(1, std::memory_order_relaxed);
     Command command;
     command.type = CommandType::Present;
     command.extra = std::make_unique<CommandExtra>();

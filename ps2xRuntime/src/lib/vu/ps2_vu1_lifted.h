@@ -71,7 +71,7 @@ struct VU1Lifted
     static void waitFdiv(VU1Interpreter &vu);
     static void waitEfuResource(VU1Interpreter &vu);
     static void waitP(VU1Interpreter &vu);
-    static int16_t bv(const VU1Interpreter &vu, const BranchBackup &bk, uint8_t reg);
+    static int16_t bv(const int32_t *vi, const VU1Interpreter &vu, const BranchBackup &bk, uint8_t reg);
     static void xgkick(VU1Interpreter &vu, uint32_t qwordAddress);
     static int handoff(VU1Interpreter &vu, const BranchBackup &bk, uint32_t pc);
     static int yield(VU1Interpreter &vu, const BranchBackup &bk, uint32_t pc);
@@ -83,9 +83,20 @@ struct VU1Lifted
     // value only when the float result is near the edges of the range. Flags is false where the
     // generator proved no FMAND/FMEQ/FMOR can observe this op's MAC/status.
     static float nrm(float value);
+    // execLower's DIV/SQRT/RSQRT/ERLENG/ESQRT and execUpper's CLIP on the lifted register copies.
+    static void opDiv(VU1Interpreter &vu, float numRaw, float denRaw);
+    static void opSqrt(VU1Interpreter &vu, float valueRaw);
+    static void opRsqrt(VU1Interpreter &vu, float numRaw, float radicandRaw);
+    static void opErleng(VU1Interpreter &vu, const float *v);
+    static void opEsqrt(VU1Interpreter &vu, float valueRaw);
+    static void opClip(VU1Interpreter &vu, const float *fs, float ftw);
     static float ftoi(float value, float scale);
+    // lvf/lacc: the lifted program's register copies, synced into the interpreter state before its
+    // exact-result and flag functions read it.
     template <uint8_t Dest, bool Flags>
-    static void fmacStore(VU1Interpreter &vu, uint32_t word, float *result, float *dst);
+    static void fmacStore(VU1Interpreter &vu, uint32_t word, float *result, float *dst, const float (*lvf)[4], const float *lacc);
+    static void fmacStoreSlow(VU1Interpreter &vu, uint32_t word, float *result, float *dst, const float (*lvf)[4], const float *lacc,
+                              uint8_t dest, bool flags);
 };
 
 #endif
