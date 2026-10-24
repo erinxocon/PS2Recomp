@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
+#include "ps2_vu1_census.h"
 
 #include <algorithm>
 #include <cfenv>
@@ -1843,6 +1844,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
+    if (m_unit == Unit::VU1 && vu1census::enabled())
+        vu1census::onExecute(vuCode, codeSize, memory ? memory->getVU1CodeGeneration() : 0u, m_state.pc);
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -1876,6 +1879,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
     const uint64_t runStartCycle = m_cycle;
+    const bool census = m_unit == Unit::VU1 && vu1census::enabled();
     bool programEnded = false;
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
@@ -1920,6 +1924,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
         if (m_cycle >= budgetEnd)
             break;
+
+        const uint32_t pairPc = m_state.pc;
+        if (census)
+        {
+            vu1census::onPair(pairPc, decoded.lower, decoded.upper, m_cycle, m_state.vi, vuData, dataSize);
+            if (decoded.lowerUsage.pipeline == PipelineBranch && m_viBranchBackupValid &&
+                (decoded.lowerUsage.viRead & (1u << m_viBranchBackupReg)) != 0u &&
+                m_viBranchBackupValue != m_state.vi[m_viBranchBackupReg])
+                vu1census::onBranchViBackup(pairPc);
+        }
 
         uint8_t writtenVi = 0u;
         int32_t oldVi = 0;
@@ -1966,6 +1980,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
 
         m_viBranchBackupValid = false;
+        if (census && !decoded.iBit && ((decoded.lower >> 25) == 0x24u || (decoded.lower >> 25) == 0x25u))
+            vu1census::onJump(pairPc, m_state.branchTarget);
 
         if (writtenVi != 0u)
         {
@@ -2049,6 +2065,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     }
     m_state.cycles = m_cycle;
     g_traceVuCycles += m_cycle - runStartCycle;
+    if (census)
+        vu1census::onRunEnd(m_cycle - runStartCycle);
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }
