@@ -1573,6 +1573,54 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
     };
 
+    // Row runs for the common formats: the same writes as the per-pixel loop below, without its
+    // per-pixel dispatch and position bookkeeping (texture streaming is a hot path).
+    const WriteVramFunc write = m_writeVramFuncs[dpsm & (kPsmHandlerCount - 1u)];
+    const uint32_t dsay = m_transfer.trxpos.dsay;
+    const bool bytePixels = dpsm == GS_PSM_T8 || dpsm == GS_PSM_T8H;
+    if (bytePixels || dpsm == GS_PSM_CT32 || dpsm == GS_PSM_Z32)
+    {
+        const uint32_t bpp = bytePixels ? 1u : 4u;
+        while (m_transferState.direction == 0u && sizeBytes - offset >= bpp)
+        {
+            const uint32_t copied = m_transferState.copiedPixels;
+            const uint32_t x = dsax + copied % rrw, y = dsay + copied / rrw;
+            const uint32_t n = std::min({rrw - copied % rrw, (sizeBytes - offset) / bpp, m_transferState.totalPixels - copied});
+            if (bytePixels)
+                for (uint32_t i = 0; i < n; ++i)
+                    write(m_vram, dbp, dbw, x + i, y, data[offset + i]);
+            else
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    uint32_t value = 0u;
+                    std::memcpy(&value, data + offset + 4u * i, sizeof(value));
+                    write(m_vram, dbp, dbw, x + i, y, value);
+                }
+            offset += n * bpp;
+            advancePixel(n);
+        }
+        return;
+    }
+    if ((dpsm == GS_PSM_T4 || dpsm == GS_PSM_T4HL || dpsm == GS_PSM_T4HH) && (rrw % 2u) == 0u)
+    {
+        while (m_transferState.direction == 0u && offset < sizeBytes && (m_transferState.copiedPixels % 2u) == 0u)
+        {
+            const uint32_t copied = m_transferState.copiedPixels;
+            const uint32_t x = dsax + copied % rrw, y = dsay + copied / rrw;
+            const uint32_t n = std::min({rrw - copied % rrw, (sizeBytes - offset) * 2u, m_transferState.totalPixels - copied}) & ~1u;
+            if (n == 0u)
+                break;
+            for (uint32_t i = 0; i < n; i += 2u)
+            {
+                const uint8_t packed = data[offset + i / 2u];
+                write(m_vram, dbp, dbw, x + i, y, packed & 0x0Fu);
+                write(m_vram, dbp, dbw, x + i + 1u, y, (packed >> 4u) & 0x0Fu);
+            }
+            offset += n / 2u;
+            advancePixel(n);
+        }
+    }
+
     while (offset < sizeBytes && m_transferState.direction == 0u)
     {
         switch (dpsm)
