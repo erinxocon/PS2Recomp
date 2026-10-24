@@ -111,6 +111,11 @@ private:
     static constexpr size_t kMaxReadyBatches = 64;
 
     void Enqueue(Command &&command);
+    // A cleared CommandExtra, reusing one the host thread finished with (keeps its data buffer).
+    std::unique_ptr<CommandExtra> NewExtra() const;
+    // Host thread: hands an executed batch's vector and extras back for reuse. Allocating them
+    // fresh per batch (a 1024-command vector is ~400 KiB) cost the guest thread page faults.
+    void Recycle(std::vector<Command> &&batch);
     void PublishLocked();
     // Runs fn on the host thread behind everything queued so far and waits for it (inline when
     // called on the host thread, or before the host loop runs).
@@ -131,6 +136,8 @@ private:
     mutable std::condition_variable m_doneCv;
     mutable std::vector<Command> m_pending;
     mutable std::deque<std::vector<Command>> m_ready;
+    mutable std::vector<std::vector<Command>> m_spareBatches;    // under m_mutex
+    mutable std::vector<std::unique_ptr<CommandExtra>> m_spareExtras; // under m_mutex
     mutable uint64_t m_queued = 0;
     uint64_t m_completed = 0;
     bool m_stopped = false;

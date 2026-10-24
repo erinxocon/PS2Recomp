@@ -373,7 +373,10 @@ public:
     explicit GSGpuRenderer(GSCpuBackend &cpu) : m_cpu(cpu)
     {
         m_mirrorVersion.fill(~0ull);
-        m_scale = 2;
+        // 2x by default; 1x when verifying against the CPU rasterizer (upscaled output shows one
+        // field at a time, so it cannot match the CPU's woven frames) unless a scale is given.
+        const char *verify = std::getenv("PS2X_GS_GPU_VERIFY");
+        m_scale = verify && *verify && std::strcmp(verify, "0") != 0 ? 1 : 2;
         if (const char *v = std::getenv("PS2X_GS_SCALE"))
             m_scale = static_cast<uint32_t>(std::clamp(std::atoi(v), 1, 8));
     }
@@ -1787,8 +1790,58 @@ void GSGpuBackend::PublishLocked()
         return;
     m_ready.push_back(std::move(m_pending));
     m_pending.clear();
-    m_pending.reserve(1024);
+    if (!m_spareBatches.empty())
+    {
+        m_pending = std::move(m_spareBatches.back());
+        m_spareBatches.pop_back();
+    }
+    else
+        m_pending.reserve(1024);
     m_workCv.notify_one();
+}
+
+std::unique_ptr<GSGpuBackend::CommandExtra> GSGpuBackend::NewExtra() const
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_spareExtras.empty())
+        {
+            std::unique_ptr<CommandExtra> extra = std::move(m_spareExtras.back());
+            m_spareExtras.pop_back();
+            return extra;
+        }
+    }
+    return std::make_unique<CommandExtra>();
+}
+
+void GSGpuBackend::Recycle(std::vector<Command> &&batch)
+{
+    constexpr size_t kMaxSpareBatches = 8, kMaxSpareExtras = 64, kMaxKeptData = 4u << 20;
+    std::vector<std::unique_ptr<CommandExtra>> extras;
+    for (Command &command : batch)
+    {
+        if (!command.extra)
+            continue;
+        CommandExtra &e = *command.extra;
+        e.tex0 = {};
+        e.texclut = {};
+        e.transfer = {};
+        e.data.clear();
+        if (e.data.capacity() > kMaxKeptData)
+            std::vector<uint8_t>().swap(e.data);
+        std::fill(std::begin(e.args), std::end(e.args), 0u);
+        e.presentRequest = {};
+        e.presentCallback = nullptr;
+        e.call = nullptr;
+        extras.push_back(std::move(command.extra));
+    }
+    batch.clear();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_spareBatches.size() < kMaxSpareBatches)
+        m_spareBatches.push_back(std::move(batch));
+    for (auto &extra : extras)
+        if (m_spareExtras.size() < kMaxSpareExtras)
+            m_spareExtras.push_back(std::move(extra));
 }
 
 void GSGpuBackend::Enqueue(Command &&command)
@@ -1846,7 +1899,7 @@ void GSGpuBackend::RunOnHost(const std::function<void()> &fn) const
         return;
     Command command;
     command.type = CommandType::Call;
-    command.extra = std::make_unique<CommandExtra>();
+    command.extra = NewExtra();
     command.extra->call = fn;
     self->m_pending.push_back(std::move(command));
     const uint64_t target = ++self->m_queued;
@@ -1891,6 +1944,7 @@ void GSGpuBackend::PumpHostThread(std::chrono::steady_clock::time_point deadline
             m_ready.pop_front();
         }
         ExecuteBatch(batch);
+        Recycle(std::move(batch));
         if (std::chrono::steady_clock::now() >= deadline)
             break;
     }
@@ -2135,7 +2189,7 @@ void GSGpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
     Command command;
     command.type = CommandType::LoadClut;
-    command.extra = std::make_unique<CommandExtra>();
+    command.extra = NewExtra();
     command.extra->tex0 = tex0;
     command.extra->texclut = texclut;
     Enqueue(std::move(command));
@@ -2145,7 +2199,7 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &transferCommand)
 {
     Command command;
     command.type = CommandType::BeginTransfer;
-    command.extra = std::make_unique<CommandExtra>();
+    command.extra = NewExtra();
     command.extra->transfer = transferCommand;
     Enqueue(std::move(command));
 }
@@ -2154,7 +2208,7 @@ void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     Command command;
     command.type = CommandType::UploadImage;
-    command.extra = std::make_unique<CommandExtra>();
+    command.extra = NewExtra();
     command.extra->data.assign(data, data + sizeBytes);
     Enqueue(std::move(command));
 }
@@ -2200,7 +2254,7 @@ bool GSGpuBackend::PresentAsync(const GSPresentationRequest &request, PresentCal
     g_host.presents.fetch_add(1, std::memory_order_relaxed);
     Command command;
     command.type = CommandType::Present;
-    command.extra = std::make_unique<CommandExtra>();
+    command.extra = NewExtra();
     command.extra->presentRequest = request;
     command.extra->presentCallback = std::move(callback);
     Enqueue(std::move(command));
@@ -2248,7 +2302,7 @@ void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t 
 {
     Command command;
     command.type = CommandType::WriteVram;
-    command.extra = std::make_unique<CommandExtra>();
+    command.extra = NewExtra();
     command.extra->args[0] = psm;
     command.extra->args[1] = base;
     command.extra->args[2] = bw;
