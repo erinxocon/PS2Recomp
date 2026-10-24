@@ -54,16 +54,19 @@ namespace
     }
 
     // Pages a w x h rectangle at (x, y) of a buffer at block `bp` with width `bw` (64-pixel units)
-    // can touch. Conservative: whole page rows, plus one page when the base is not page aligned.
-    void pageSpan(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t y, uint32_t h, uint32_t &first, uint32_t &count)
+    // can touch: GSMem pages are base + (y / page height) * (bw * 64 / page width) + x / page width,
+    // which grows with x and y, so the corners bound it (x past the buffer width spills into the
+    // following pages). One more page when the base is not page aligned.
+    void pageSpan(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t &first,
+                  uint32_t &count)
     {
         uint32_t pw, ph;
         pageSize(psm, pw, ph);
-        const uint32_t perRow = std::max<uint32_t>(1u, (std::max<uint32_t>(bw, 1u) * 64u + pw - 1u) / pw);
-        const uint32_t rowFirst = y / ph;
-        const uint32_t rowLast = (y + std::max<uint32_t>(h, 1u) - 1u) / ph;
-        first = bp / 32u + rowFirst * perRow;
-        count = (rowLast - rowFirst + 1u) * perRow + ((bp % 32u) ? 1u : 0u);
+        const uint32_t perRow = (bw * 64u) / pw;
+        auto page = [&](uint32_t px, uint32_t py) { return bp / 32u + (py / ph) * perRow + px / pw; };
+        first = page(x, y);
+        const uint32_t last = page(x + std::max<uint32_t>(w, 1u) - 1u, y + std::max<uint32_t>(h, 1u) - 1u) + ((bp % 32u) ? 1u : 0u);
+        count = last - first + 1u;
     }
 
     uint32_t rgba5551To8888(uint32_t c)
@@ -370,6 +373,7 @@ public:
     explicit GSGpuRenderer(GSCpuBackend &cpu) : m_cpu(cpu)
     {
         m_mirrorVersion.fill(~0ull);
+        m_scale = 2;
         if (const char *v = std::getenv("PS2X_GS_SCALE"))
             m_scale = static_cast<uint32_t>(std::clamp(std::atoi(v), 1, 8));
     }
@@ -438,7 +442,7 @@ private:
         uint64_t clamp;
         uint32_t fogColor;
         uint32_t tbp, tbw, texPsm, texa;
-        GLuint palette;
+        uint32_t palette; // generation of the palette texture contents
         uint32_t texW, texH;
         bool operator==(const DrawKey &o) const { return std::memcmp(this, &o, sizeof(*this)) == 0; }
     };
@@ -453,7 +457,7 @@ private:
     void PrepareTextureSource(const GSDrawState &state);
     void SyncMirror();
     GLuint SwizzleTable(uint32_t psm, uint32_t &pw, uint32_t &ph);
-    GLuint GetPalette(const GSDrawState &state);
+    uint32_t GetPalette(const GSDrawState &state);
     void ApplyKey(const DrawKey &key, Target *color, Target *depth);
     void BumpPages(uint32_t first, uint32_t count);
     // 1x staging texture of the given kind, at least w x h.
@@ -476,7 +480,10 @@ private:
     std::array<uint64_t, kPageCount> m_mirrorVersion{};
     bool m_mirrorDirty = true;
     std::map<const uint16_t *, GLuint> m_swizzleTables;
-    std::map<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t>, GLuint> m_palettes;
+    GLuint m_paletteTex = 0;
+    std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t> m_paletteKey{};
+    uint32_t m_paletteEntries[256]{};
+    uint32_t m_paletteGeneration = 0;
     std::array<uint64_t, kPageCount> m_pageVersion{};
     uint64_t m_versionCounter = 0;
     uint64_t m_useCounter = 0;
@@ -660,8 +667,9 @@ void GSGpuRenderer::Release()
         return;
     for (auto &t : m_targets)
         glDeleteTextures(1, &t->tex);
-    for (auto &[k, p] : m_palettes)
-        glDeleteTextures(1, &p);
+    if (m_paletteTex)
+        glDeleteTextures(1, &m_paletteTex);
+    m_paletteTex = 0;
     for (auto &[k, f] : m_fbos)
         glDeleteFramebuffers(1, &f);
     for (auto &[k, t] : m_swizzleTables)
@@ -670,7 +678,6 @@ void GSGpuRenderer::Release()
         glDeleteTextures(1, &m_mirrorTex);
     m_mirrorTex = 0;
     m_targets.clear();
-    m_palettes.clear();
     m_fbos.clear();
     m_swizzleTables.clear();
     glDeleteBuffers(1, &m_vbo);
@@ -850,7 +857,7 @@ GSGpuRenderer::Target *GSGpuRenderer::FindOrCreateTarget(uint32_t fbp, uint32_t 
     }
 
     uint32_t first, count;
-    pageSpan(psm, fbp * 32u, fbw, 0u, height, first, count);
+    pageSpan(psm, fbp * 32u, fbw, 0u, 0u, width, height, first, count);
     // Anything else on these pages becomes stale: write it back and drop it.
     FlushDraws();
     for (auto it = m_targets.begin(); it != m_targets.end();)
@@ -1001,7 +1008,7 @@ void GSGpuRenderer::PrepareTextureSource(const GSDrawState &state)
 {
     const GSTex0Reg &tex0 = state.context.tex0;
     uint32_t first, count;
-    pageSpan(tex0.psm, tex0.tbp0, tex0.tbw, 0u, state.textureHeight, first, count);
+    pageSpan(tex0.psm, tex0.tbp0, tex0.tbw, 0u, 0u, state.textureWidth, state.textureHeight, first, count);
     DownloadOverlapping(first, count, "texture");
     SyncMirror();
 }
@@ -1067,36 +1074,42 @@ GLuint GSGpuRenderer::SwizzleTable(uint32_t psm, uint32_t &pw, uint32_t &ph)
     return tex;
 }
 
-GLuint GSGpuRenderer::GetPalette(const GSDrawState &state)
+// One palette texture, rewritten when the CLUT (or how it is read) changes. Draws batched against
+// the previous contents are flushed first; the returned generation goes into the draw key.
+uint32_t GSGpuRenderer::GetPalette(const GSDrawState &state)
 {
     const GSTex0Reg &tex0 = state.context.tex0;
     const uint64_t texa = static_cast<uint64_t>(state.texa.ta0) | (static_cast<uint64_t>(state.texa.ta1) << 8) |
                           (static_cast<uint64_t>(state.texa.aem) << 16);
     const auto key = std::make_tuple(m_cpu.ClutVersion(), static_cast<uint32_t>(tex0.cpsm), static_cast<uint32_t>(tex0.csm),
                                      static_cast<uint32_t>(tex0.csa), static_cast<uint32_t>(tex0.psm), texa);
-    auto it = m_palettes.find(key);
-    if (it != m_palettes.end())
-        return it->second;
-    if (m_palettes.size() >= 256u)
-    {
-        for (auto &[k, p] : m_palettes)
-            glDeleteTextures(1, &p);
-        m_palettes.clear();
-    }
+    if (m_paletteTex && key == m_paletteKey)
+        return m_paletteGeneration;
     uint32_t entries[256];
     for (uint32_t i = 0; i < 256u; ++i)
         entries[i] = m_cpu.PaletteEntry(state, static_cast<uint8_t>(i));
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
+    if (m_paletteTex && std::memcmp(entries, m_paletteEntries, sizeof(entries)) == 0)
+    {
+        m_paletteKey = key; // reloaded with the same colours
+        return m_paletteGeneration;
+    }
+    FlushDraws();
     glActiveTexture(GL_TEXTURE3);
-    glBindTexture(GL_TEXTURE_2D, tex);
+    if (!m_paletteTex)
+    {
+        glGenTextures(1, &m_paletteTex);
+        glBindTexture(GL_TEXTURE_2D, m_paletteTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    glBindTexture(GL_TEXTURE_2D, m_paletteTex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, entries);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, GL_RGBA, GL_UNSIGNED_BYTE, entries);
     glActiveTexture(GL_TEXTURE0);
-    m_palettes.emplace(key, tex);
-    return tex;
+    std::memcpy(m_paletteEntries, entries, sizeof(entries));
+    m_paletteKey = key;
+    return ++m_paletteGeneration;
 }
 
 void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
@@ -1184,8 +1197,8 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
         if (key.depthMode && mask != 0u)
         {
             uint32_t cf, cc, zf, zc;
-            pageSpan(key.colorPsm, key.colorFbp * 32u, key.colorFbw, 0u, height, cf, cc);
-            pageSpan(key.zpsm, key.zbp * 32u, key.colorFbw, 0u, height, zf, zc);
+            pageSpan(key.colorPsm, key.colorFbp * 32u, key.colorFbw, 0u, 0u, key.colorFbw * 64u, height, cf, cc);
+            pageSpan(key.zpsm, key.zbp * 32u, key.colorFbw, 0u, 0u, key.colorFbw * 64u, height, zf, zc);
             if (rangesOverlap(cf, cc, zf, zc))
             {
                 Note("color-depth-overlap");
@@ -1391,7 +1404,7 @@ void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, swizzle);
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, key.palette);
+    glBindTexture(GL_TEXTURE_2D, key.palette ? m_paletteTex : 0u);
     glActiveTexture(GL_TEXTURE0);
 
     // Blending: (A - B) * C / 128 + D with A, B, D in {Cs, Cd, 0} and C in {As, Ad, FIX}, as
@@ -1747,7 +1760,7 @@ namespace
 bool GSGpuBackend::Requested()
 {
     const char *v = std::getenv("PS2X_GS_BACKEND");
-    return v && std::strcmp(v, "gpu") == 0;
+    return !(v && std::strcmp(v, "cpu") == 0);
 }
 
 GSGpuBackend::GSGpuBackend()
@@ -1758,7 +1771,7 @@ GSGpuBackend::GSGpuBackend()
         m_shadow = std::make_unique<GSCpuBackend>();
         std::cerr << "[gs-gpu] verifying against the CPU rasterizer (PS2X_GS_GPU_VERIFY)" << std::endl;
     }
-    std::cerr << "[gs-gpu] GPU GS backend selected (PS2X_GS_BACKEND=gpu)" << std::endl;
+    std::cerr << "[gs-gpu] GPU GS backend (PS2X_GS_BACKEND=cpu for the CPU rasterizer)" << std::endl;
 }
 
 GSGpuBackend::~GSGpuBackend() = default;
@@ -1930,7 +1943,12 @@ void GSGpuBackend::Execute(Command &command)
     case CommandType::LoadClut:
     {
         uint32_t first, count;
-        pageSpan(command.extra->tex0.cpsm, command.extra->tex0.cbp, 1u, 0u, 16u, first, count);
+        const GSTex0Reg &tex0 = command.extra->tex0;
+        const GSTexClutReg &clut = command.extra->texclut;
+        if (tex0.csm == 0u)
+            pageSpan(tex0.cpsm, tex0.cbp, 1u, 0u, 0u, 16u, 16u, first, count);
+        else
+            pageSpan(tex0.cpsm, tex0.cbp, std::max<uint32_t>(clut.cbw, 1u), clut.cou * 16u, clut.cov, 256u, 1u, first, count);
         r.DownloadOverlapping(first, count, "clut");
         m_cpu.LoadClut(command.extra->tex0, command.extra->texclut);
         if (m_shadow)
@@ -1944,11 +1962,11 @@ void GSGpuBackend::Execute(Command &command)
         if (t.direction == 1u || t.direction == 2u)
         {
             uint32_t first, count;
-            pageSpan(t.bitbltbuf.spsm, t.bitbltbuf.sbp, t.bitbltbuf.sbw, t.trxpos.ssay, t.trxreg.rrh, first, count);
+            pageSpan(t.bitbltbuf.spsm, t.bitbltbuf.sbp, t.bitbltbuf.sbw, t.trxpos.ssax, t.trxpos.ssay, t.trxreg.rrw, t.trxreg.rrh, first, count);
             r.DownloadOverlapping(first, count, "transfer-source");
         }
         uint32_t first, count;
-        pageSpan(t.bitbltbuf.dpsm, t.bitbltbuf.dbp, t.bitbltbuf.dbw, t.trxpos.dsay, t.trxreg.rrh, first, count);
+        pageSpan(t.bitbltbuf.dpsm, t.bitbltbuf.dbp, t.bitbltbuf.dbw, t.trxpos.dsax, t.trxpos.dsay, t.trxreg.rrw, t.trxreg.rrh, first, count);
         if (t.direction == 0u || t.direction == 2u)
             r.DownloadOverlapping(first, count, "transfer-dest"); // partial writes keep the rest of the pages
         m_cpu.BeginTransfer(t);
