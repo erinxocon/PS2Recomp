@@ -58,6 +58,8 @@ struct VU1Lifted
     struct Snapshot;
 
     static int runProgram(VU1Interpreter &vu, LiftedRun &run, uint32_t startPc);
+    // ps2_vu1_native.cpp: entry 0x1B68 in plain C++; kLiftEnd, or kLiftNotLifted with nothing changed.
+    static int runNative(VU1Interpreter &vu, LiftedRun &run);
     static int runLifted(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
                          uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t maxCycles);
     static void verifyExecute(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
