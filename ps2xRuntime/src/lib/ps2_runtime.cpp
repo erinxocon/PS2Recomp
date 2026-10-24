@@ -20,6 +20,7 @@
 #include <fstream>
 #include <algorithm>
 #include <array>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +58,8 @@ static int g_pendingWindowWidth = 0;
 static int g_pendingWindowHeight = 0;
 static int g_framesShown = 0;
 static bool g_windowSizeFixed = false;
+// Set by SIGINT/SIGTERM so Ctrl+C in the terminal shuts down like closing the window.
+static volatile std::sig_atomic_t g_signalStop = 0;
 
 struct ElfHeader
 {
@@ -2593,6 +2596,8 @@ void PS2Runtime::run()
     SetTextureFilter(frameTex, TEXTURE_FILTER_BILINEAR);
 
     std::atomic<bool> gameThreadFinished{false};
+    std::signal(SIGINT, [](int) { g_signalStop = 1; });
+    std::signal(SIGTERM, [](int) { g_signalStop = 1; });
 
     std::thread gameThread([&]()
                            {
@@ -2754,7 +2759,7 @@ void PS2Runtime::run()
                                   (GetMonitorHeight(monitor) - g_pendingWindowHeight) / 2);
             g_pendingWindowWidth = g_pendingWindowHeight = 0;
         }
-        if (WindowShouldClose())
+        if (WindowShouldClose() || g_signalStop)
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
             requestStop();

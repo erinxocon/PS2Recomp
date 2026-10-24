@@ -9,6 +9,20 @@
 #include <cstring>
 #include <vector>
 
+#if !defined(PLATFORM_VITA)
+// raylib 5.5 compiles miniaudio (and exports it) with these options; they change the layout of
+// ma_device, so they must match its build.
+#define MA_NO_JACK
+#define MA_NO_WAV
+#define MA_NO_FLAC
+#define MA_NO_MP3
+#define MA_NO_RESOURCE_MANAGER
+#define MA_NO_NODE_GRAPH
+#define MA_NO_ENGINE
+#define MA_NO_GENERATION
+#include "external/miniaudio.h"
+#endif
+
 namespace
 {
     std::vector<uint8_t> buildWavFromPcm(const int16_t *pcm, size_t sampleCount, uint32_t sampleRate)
@@ -115,6 +129,13 @@ namespace
 
         void shutdown()
         {
+#if !defined(PLATFORM_VITA)
+            if (m_deviceOpen)
+            {
+                ma_device_uninit(&m_device);
+                m_deviceOpen = false;
+            }
+#endif
             std::lock_guard<std::mutex> lock(m_dumpMutex);
             finalizeDump();
         }
@@ -238,12 +259,62 @@ namespace
             m_statFrames = 0;
         }
 
+        // The SPU2 output gets its own miniaudio device with short periods: raylib's shared device
+        // buffers ~75 ms (3600 frames on PulseAudio/PipeWire), which is heard as that much lag.
+        // PS2X_AUDIO_PERIOD_MS sets the period (default 5, three periods); PS2X_AUDIO_RAYLIB=1 plays
+        // through a raylib stream instead.
+        bool openDevice()
+        {
+#if defined(PLATFORM_VITA)
+            return false;
+#else
+            if (std::getenv("PS2X_AUDIO_RAYLIB"))
+                return false;
+            const char *periodEnv = std::getenv("PS2X_AUDIO_PERIOD_MS");
+            const long periodMs = periodEnv ? std::clamp(std::strtol(periodEnv, nullptr, 10), 1L, 100L) : 5L;
+            ma_device_config config = ma_device_config_init(ma_device_type_playback);
+            config.playback.format = ma_format_s16;
+            config.playback.channels = 2;
+            config.sampleRate = static_cast<ma_uint32>(kSampleRate);
+            config.periodSizeInMilliseconds = static_cast<ma_uint32>(periodMs);
+            config.periods = 3;
+            config.performanceProfile = ma_performance_profile_low_latency;
+            config.dataCallback = [](ma_device *, void *output, const void *, ma_uint32 frames)
+            { instance().pull(static_cast<int16_t *>(output), frames); };
+            if (ma_device_init(nullptr, &config, &m_device) != MA_SUCCESS)
+                return false;
+            if (ma_device_start(&m_device) != MA_SUCCESS)
+            {
+                ma_device_uninit(&m_device);
+                return false;
+            }
+            m_deviceOpen = true;
+            const ma_uint32 buffered = m_device.playback.internalPeriodSizeInFrames * m_device.playback.internalPeriods;
+            std::printf("[audio] %s device, %u Hz, %u frames buffered (%.1f ms)\n",
+                        ma_get_backend_name(m_device.pContext->backend), m_device.playback.internalSampleRate, buffered,
+                        buffered * 1000.0 / m_device.playback.internalSampleRate);
+            return true;
+#endif
+        }
+
         void ensureStream()
         {
 #if defined(PLATFORM_VITA)
             return;
 #else
-            if (m_streamTried || !IsAudioDeviceReady())
+            if (m_streamTried)
+                return;
+            if (!m_deviceTried)
+            {
+                m_deviceTried = true;
+                if (openDevice())
+                {
+                    m_streamTried = true;
+                    m_streamReady = true;
+                    return;
+                }
+            }
+            if (!IsAudioDeviceReady())
                 return;
             m_streamTried = true;
             SetAudioStreamBufferSizeDefault(1024);
@@ -335,7 +406,10 @@ namespace
         uint32_t m_statLongGaps = 0;
         bool m_streamTried = false;
         bool m_streamReady = false;
+        bool m_deviceTried = false;
+        bool m_deviceOpen = false;
 #if !defined(PLATFORM_VITA)
+        ma_device m_device{};
         AudioStream m_stream{};
 #endif
         std::mutex m_dumpMutex;
