@@ -3,6 +3,7 @@
 #include "runtime/gs/ps2_gs_common.h"
 
 #include "external/glad.h" // raylib's loader: its GL entry points are loaded once the window exists
+#include "raylib.h"
 
 #include <algorithm>
 #include <array>
@@ -228,6 +229,55 @@ void main()
 }
 )";
 
+    const char *kPresentVertexShader = R"(#version 330
+void main()
+{
+    // Full-target triangle.
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+    // Builds the displayed picture from field snapshots (rows of the target are GS lines, row 0 first).
+    // Mode 0 copies the current snapshot; mode 1 weaves the current and previous field (GS field
+    // rendering: two half-height buffers a line apart) like the CPU FieldWeaver, expanding each
+    // logical line to uScale rows and repairing combing on the older field's lines.
+    const char *kPresentFragmentShader = R"(#version 330
+uniform sampler2D uCur;
+uniform sampler2D uPrev;
+uniform int uMode;
+uniform int uCurOnEven;
+uniform int uScale;
+uniform int uLines;
+out vec4 oColor;
+void main()
+{
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    if (uMode == 0)
+    {
+        oColor = vec4(texelFetch(uCur, p, 0).rgb, 1.0);
+        return;
+    }
+    int line = p.y / uScale;
+    int sub = p.y - line * uScale;
+    bool fromCur = ((line & 1) == 0) == (uCurOnEven != 0);
+    vec4 c = fromCur ? texelFetch(uCur, ivec2(p.x, (line >> 1) * uScale + sub), 0)
+                     : texelFetch(uPrev, ivec2(p.x, (line >> 1) * uScale + sub), 0);
+    if (!fromCur)
+    {
+        int above = line > 0 ? line - 1 : line + 1;
+        int below = line + 1 < 2 * uLines ? line + 1 : line - 1;
+        vec4 a = texelFetch(uCur, ivec2(p.x, (above >> 1) * uScale + sub), 0);
+        vec4 b = texelFetch(uCur, ivec2(p.x, (below >> 1) * uScale + sub), 0);
+        vec3 lo = min(a.rgb, b.rgb) - 24.0 / 255.0;
+        vec3 hi = max(a.rgb, b.rgb) + 24.0 / 255.0;
+        if (any(lessThan(c.rgb, lo)) || any(greaterThan(c.rgb, hi)))
+            c = (a + b) * 0.5;
+    }
+    oColor = vec4(c.rgb, 1.0);
+}
+)";
+
     GLuint compileShader(GLenum type, const char *source)
     {
         GLuint shader = glCreateShader(type);
@@ -260,7 +310,12 @@ void main()
 class GSGpuRenderer
 {
 public:
-    explicit GSGpuRenderer(GSCpuBackend &cpu) : m_cpu(cpu) {}
+    explicit GSGpuRenderer(GSCpuBackend &cpu) : m_cpu(cpu)
+    {
+        if (const char *v = std::getenv("PS2X_GS_SCALE"))
+            m_scale = static_cast<uint32_t>(std::clamp(std::atoi(v), 1, 8));
+    }
+    uint32_t Scale() const { return m_scale; }
     ~GSGpuRenderer() { Release(); }
 
     void EnsureGl();
@@ -274,12 +329,30 @@ public:
     // Make GS memory current for pages [first, first + count) (or all of it).
     void DownloadOverlapping(uint32_t first, uint32_t count);
     void DownloadAll();
+    // Colour buffers presentation may read (display buffers, the last draw targets).
+    void DownloadForPresent(const GSPresentationRequest &request);
     // GS memory in [first, first + count) was written by someone else.
     void InvalidatePages(uint32_t first, uint32_t count);
     void InvalidateAll();
     void Reset();
 
-    uint64_t unsupported = 0;
+    // Presentation straight from the GPU targets (false: the caller uses the CPU path).
+    bool PresentFromGpu(const GSPresentationRequest &request);
+    bool HasPresentation() const { return m_presentValid; }
+    void InvalidatePresentation() { m_presentValid = false; }
+    void DrawPresentation(float x, float y, float w, float h);
+
+    // GS features the renderer does not reproduce exactly, by reason (reported by PS2X_GS_GPU_VERIFY
+    // and at exit).
+    std::map<std::string, uint64_t> unsupported;
+    void Note(const char *reason) { ++unsupported[reason]; }
+    std::string UnsupportedSummary() const
+    {
+        std::string out;
+        for (const auto &[reason, n] : unsupported)
+            out += " " + reason + "=" + std::to_string(n);
+        return out.empty() ? " none" : out;
+    }
 
 private:
     struct Target
@@ -330,6 +403,11 @@ private:
     GLuint GetPalette(const GSDrawState &state);
     void ApplyKey(const DrawKey &key, Target *color, Target *depth);
     void BumpPages(uint32_t first, uint32_t count);
+    // 1x staging texture of the given kind, at least w x h.
+    GLuint Staging(bool depth, uint32_t w, uint32_t h);
+    // Nearest-filtered copy of a whole texture onto another (both colour or both depth).
+    void Blit(GLuint src, uint32_t sw, uint32_t sh, GLuint dst, uint32_t dw, uint32_t dh, bool depth);
+    void BlitRect(GLuint src, int sx, int sy, int sw, int sh, GLuint dst, int dx, int dy, int dw, int dh, bool depth);
     uint64_t MaxVersion(uint32_t first, uint32_t count) const;
 
     GSCpuBackend &m_cpu;
@@ -352,10 +430,103 @@ private:
     Target *m_keyColor = nullptr;
     Target *m_keyDepth = nullptr;
     GLint m_savedViewport[4]{};
+    uint32_t m_scale = 1;
+    GLuint m_staging[2] = {0, 0};
+    uint32_t m_stagingSize[2][2] = {{0, 0}, {0, 0}};
+    GLuint m_blitFbo[2] = {0, 0};
+
+    struct FieldSnapshot
+    {
+        GLuint tex = 0;
+        uint32_t w = 0, h = 0, fbp = 0;
+        uint64_t tick = 0;
+        bool valid = false;
+    };
+    void CopyToSnapshot(FieldSnapshot &snap, const Target &t, uint32_t ox, uint32_t oy, uint32_t w, uint32_t h, uint32_t fbp,
+                        uint64_t tick);
+    void RenderOutput(int mode, uint32_t w, uint32_t lines);
+    bool DecideFieldOrder();
+    void ReadSnapshot(const FieldSnapshot &snap, std::vector<uint8_t> &out);
+    void DumpOutput(uint64_t tick);
+    FieldSnapshot m_cur, m_prev;
+    bool m_curOnEven = true;
+    uint32_t m_newFields = 0;
+    GLuint m_outputTex = 0, m_outputFbo = 0;
+    uint32_t m_outW = 0, m_outH = 0;
+    bool m_presentValid = false;
+    GLuint m_presentProgram = 0, m_emptyVao = 0;
+    uint64_t m_presentCount = 0;
     GLboolean m_cullWasEnabled = GL_FALSE;
     std::vector<uint32_t> m_scratch;
     std::vector<float> m_scratchF;
 };
+
+GLuint GSGpuRenderer::Staging(bool depth, uint32_t w, uint32_t h)
+{
+    const int k = depth ? 1 : 0;
+    if (m_staging[k] && m_stagingSize[k][0] == w && m_stagingSize[k][1] == h)
+        return m_staging[k];
+    if (m_staging[k])
+        glDeleteTextures(1, &m_staging[k]);
+    glGenTextures(1, &m_staging[k]);
+    glBindTexture(GL_TEXTURE_2D, m_staging[k]);
+    if (depth)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, w, h, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    else
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    m_stagingSize[k][0] = w;
+    m_stagingSize[k][1] = h;
+    return m_staging[k];
+}
+
+void GSGpuRenderer::Blit(GLuint src, uint32_t sw, uint32_t sh, GLuint dst, uint32_t dw, uint32_t dh, bool depth)
+{
+    BlitRect(src, 0, 0, static_cast<int>(sw), static_cast<int>(sh), dst, 0, 0, static_cast<int>(dw), static_cast<int>(dh), depth);
+}
+
+void GSGpuRenderer::BlitRect(GLuint src, int sx, int sy, int sw, int sh, GLuint dst, int dx, int dy, int dw, int dh, bool depth)
+{
+    if (!m_blitFbo[0])
+        glGenFramebuffers(2, m_blitFbo);
+    const GLenum attachment = depth ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0;
+    GLint drawFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_blitFbo[0]);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, attachment, GL_TEXTURE_2D, src, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_blitFbo[1]);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, attachment, GL_TEXTURE_2D, dst, 0);
+    if (depth)
+    {
+        glReadBuffer(GL_NONE);
+        glDrawBuffer(GL_NONE);
+    }
+    else
+    {
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    }
+    GLboolean depthMask = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+    glDepthMask(GL_TRUE);
+    GLboolean colorMask[4];
+    glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBlitFramebuffer(sx, sy, sx + sw, sy + sh, dx, dy, dx + dw, dy + dh, depth ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+    glDepthMask(depthMask);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(drawFbo));
+    if (scissor)
+        glEnable(GL_SCISSOR_TEST);
+}
 
 GLint GSGpuRenderer::U(const char *name)
 {
@@ -402,6 +573,17 @@ void GSGpuRenderer::EnsureGl()
     glEnableVertexAttribArray(3);
     glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void *>(offsetof(Vertex, fog)));
     glBindVertexArray(0);
+
+    const GLuint pvs = compileShader(GL_VERTEX_SHADER, kPresentVertexShader);
+    const GLuint pfs = compileShader(GL_FRAGMENT_SHADER, kPresentFragmentShader);
+    m_presentProgram = glCreateProgram();
+    glAttachShader(m_presentProgram, pvs);
+    glAttachShader(m_presentProgram, pfs);
+    glLinkProgram(m_presentProgram);
+    glDeleteShader(pvs);
+    glDeleteShader(pfs);
+    glGenVertexArrays(1, &m_emptyVao);
+    std::cerr << "[gs-gpu] internal resolution x" << m_scale << " (PS2X_GS_SCALE)" << std::endl;
     std::cerr << "[gs-gpu] OpenGL renderer: " << reinterpret_cast<const char *>(glGetString(GL_RENDERER)) << std::endl;
 }
 
@@ -424,6 +606,16 @@ void GSGpuRenderer::Release()
     glDeleteBuffers(1, &m_vbo);
     glDeleteVertexArrays(1, &m_vao);
     glDeleteProgram(m_program);
+    glDeleteProgram(m_presentProgram);
+    glDeleteVertexArrays(1, &m_emptyVao);
+    for (GLuint *tex : {&m_staging[0], &m_staging[1], &m_cur.tex, &m_prev.tex, &m_outputTex})
+        if (*tex)
+            glDeleteTextures(1, tex);
+    if (m_blitFbo[0])
+        glDeleteFramebuffers(2, m_blitFbo);
+    if (m_outputFbo)
+        glDeleteFramebuffers(1, &m_outputFbo);
+    m_presentValid = false;
     m_glReady = false;
 }
 
@@ -490,6 +682,23 @@ void GSGpuRenderer::DownloadAll()
     for (auto &t : m_targets)
         if (t->gpuNewer)
             DownloadTarget(*t);
+}
+
+void GSGpuRenderer::DownloadForPresent(const GSPresentationRequest &request)
+{
+    FlushDraws();
+    auto downloadFrame = [&](uint32_t fbp, uint32_t fbw)
+    {
+        for (auto &t : m_targets)
+            if (!t->depth && t->gpuNewer && t->fbp == fbp && (fbw == 0u || t->fbw == fbw))
+                DownloadTarget(*t);
+    };
+    downloadFrame(static_cast<uint32_t>(request.dispfb1 & 0x1FFu), static_cast<uint32_t>((request.dispfb1 >> 9) & 0x3Fu));
+    downloadFrame(static_cast<uint32_t>(request.dispfb2 & 0x1FFu), static_cast<uint32_t>((request.dispfb2 >> 9) & 0x3Fu));
+    for (const GSFrameReg &frame : request.contextFrames)
+        downloadFrame(frame.fbp, 0u);
+    if (request.hasPreferredSource)
+        downloadFrame(request.preferredSource.fbp, 0u);
 }
 
 void GSGpuRenderer::InvalidatePages(uint32_t first, uint32_t count)
@@ -595,9 +804,9 @@ GSGpuRenderer::Target *GSGpuRenderer::FindOrCreateTarget(uint32_t fbp, uint32_t 
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D, t->tex);
     if (depth)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, width, height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, width * m_scale, height * m_scale, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
     else
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width * m_scale, height * m_scale, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glActiveTexture(GL_TEXTURE0);
@@ -612,7 +821,10 @@ void GSGpuRenderer::UploadTarget(Target &t)
     m_scratch.resize(n);
     m_cpu.ReadRect(t.psm, t.fbp * 32u, t.fbw, 0, 0, t.width, t.height, m_scratch.data());
     glActiveTexture(GL_TEXTURE3);
-    glBindTexture(GL_TEXTURE_2D, t.tex);
+    // At 1x the data goes straight into the target; scaled targets get it through a 1x staging
+    // texture and a nearest blit.
+    const GLuint dst = m_scale == 1u ? t.tex : Staging(t.depth, t.width, t.height);
+    glBindTexture(GL_TEXTURE_2D, dst);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     if (t.depth)
     {
@@ -629,6 +841,8 @@ void GSGpuRenderer::UploadTarget(Target &t)
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, t.width, t.height, GL_RGBA, GL_UNSIGNED_BYTE, m_scratch.data());
     }
     glActiveTexture(GL_TEXTURE0);
+    if (m_scale != 1u)
+        Blit(dst, t.width, t.height, t.tex, t.width * m_scale, t.height * m_scale, t.depth);
     t.vramNewer = false;
 }
 
@@ -638,10 +852,16 @@ void GSGpuRenderer::DownloadTarget(Target &t)
         FlushDraws();
     const uint32_t n = t.width * t.height;
     m_scratch.resize(n);
+    GLuint src = t.tex;
+    if (m_scale != 1u)
+    {
+        src = Staging(t.depth, t.width, t.height);
+        Blit(t.tex, t.width * m_scale, t.height * m_scale, src, t.width, t.height, t.depth);
+    }
     GLuint fbo = 0;
     glGenFramebuffers(1, &fbo);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
-    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, t.depth ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, t.depth ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src, 0);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     if (t.depth)
     {
@@ -689,7 +909,15 @@ GLuint GSGpuRenderer::FramebufferFor(Target *color, Target *depth)
     }
     const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     if (status != GL_FRAMEBUFFER_COMPLETE)
-        std::cerr << "[gs-gpu] incomplete framebuffer 0x" << std::hex << status << std::dec << std::endl;
+        std::cerr << "[gs-gpu] incomplete framebuffer 0x" << std::hex << status << std::dec << " color="
+                  << (color ? std::to_string(color->fbp) + "/" + std::to_string(color->width) + "x" + std::to_string(color->height) +
+                                  " psm " + std::to_string(color->psm) + " tex " + std::to_string(color->tex)
+                            : std::string("none"))
+                  << " depth="
+                  << (depth ? std::to_string(depth->fbp) + "/" + std::to_string(depth->width) + "x" + std::to_string(depth->height) +
+                                  " psm " + std::to_string(depth->psm) + " tex " + std::to_string(depth->tex)
+                            : std::string("none"))
+                  << std::endl;
     m_fbos.emplace(key, fbo);
     return fbo;
 }
@@ -840,8 +1068,12 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
     key.colorFbp = ctx.frame.fbp;
     key.colorFbw = std::max<uint32_t>(ctx.frame.fbw, 1u);
     key.colorPsm = ctx.frame.psm;
-    const bool depthTest = ztst != 1u;
-    const bool depthWrite = !ctx.zbuf.zmask;
+    // ZBUF never set up (not a Z format): no depth buffer at all.
+    const bool zbufValid = isDepthPsm(ctx.zbuf.psm);
+    if (!zbufValid && (ztst > 1u || !ctx.zbuf.zmask))
+        Note("zbuf-not-z");
+    const bool depthTest = zbufValid && ztst != 1u;
+    const bool depthWrite = zbufValid && !ctx.zbuf.zmask;
     key.depthMode = depthTest ? (depthWrite ? 2u : 1u) : (depthWrite ? 3u : 0u);
     key.zbp = key.depthMode ? ctx.zbuf.zbp : 0u;
     key.zpsm = key.depthMode ? ctx.zbuf.psm : 0u;
@@ -859,7 +1091,7 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
         else if (byte != 0xFFu)
         {
             mask |= 1u << c;
-            ++unsupported;
+            Note("partial-fbmsk");
         }
     }
     if (ctx.frame.psm == GS_PSM_CT24)
@@ -878,11 +1110,11 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
     key.atst = static_cast<uint32_t>((ctx.test >> 1) & 7u);
     key.aref = static_cast<uint32_t>((ctx.test >> 4) & 0xFFu);
     if (key.ate && ((ctx.test >> 12) & 3u) != 0u)
-        ++unsupported; // AFAIL other than KEEP
+        Note("afail");
     if ((ctx.test >> 14) & 1u)
-        ++unsupported; // DATE
+        Note("date");
     if (st.pabe)
-        ++unsupported;
+        Note("pabe");
 
     Texture *texture = nullptr;
     if (st.prim.tme)
@@ -904,13 +1136,19 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
     if (!m_haveKey || !(key == m_key))
     {
         FlushDraws();
+        if (key.depthMode && mask != 0u)
+        {
+            uint32_t cf, cc, zf, zc;
+            pageSpan(key.colorPsm, key.colorFbp * 32u, key.colorFbw, 0u, height, cf, cc);
+            pageSpan(key.zpsm, key.zbp * 32u, key.colorFbw, 0u, height, zf, zc);
+            if (rangesOverlap(cf, cc, zf, zc))
+            {
+                Note("color-depth-overlap");
+                return;
+            }
+        }
         Target *depth = key.depthMode ? FindOrCreateTarget(key.zbp, key.colorFbw, key.zpsm, true, height) : nullptr;
         Target *color = (mask != 0u) ? FindOrCreateTarget(key.colorFbp, key.colorFbw, key.colorPsm, false, height) : nullptr;
-        if (depth && std::none_of(m_targets.begin(), m_targets.end(), [&](const auto &t) { return t.get() == depth; }))
-        {
-            ++unsupported; // colour and depth buffers share pages
-            return;
-        }
         if (color && color->vramNewer)
             UploadTarget(*color);
         if (depth && depth->vramNewer)
@@ -1028,7 +1266,7 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
         break;
     }
     default:
-        ++unsupported; // points and lines are not drawn yet
+        Note(st.prim.type == GS_PRIM_POINT ? "points" : "lines");
         break;
     }
 }
@@ -1038,11 +1276,11 @@ void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
     const uint32_t width = color ? color->width : depth->width;
     const uint32_t height = color ? color->height : depth->height;
     glBindFramebuffer(GL_FRAMEBUFFER, FramebufferFor(color, depth));
-    glViewport(0, 0, width, height);
+    glViewport(0, 0, width * m_scale, height * m_scale);
     glEnable(GL_SCISSOR_TEST);
     const uint32_t sx0 = std::min(key.scissor[0], width), sy0 = std::min(key.scissor[1], height);
     const uint32_t sx1 = std::min(key.scissor[2] + 1u, width), sy1 = std::min(key.scissor[3] + 1u, height);
-    glScissor(sx0, sy0, sx1 > sx0 ? sx1 - sx0 : 0, sy1 > sy0 ? sy1 - sy0 : 0);
+    glScissor(sx0 * m_scale, sy0 * m_scale, sx1 > sx0 ? (sx1 - sx0) * m_scale : 0, sy1 > sy0 ? (sy1 - sy0) * m_scale : 0);
     glColorMask(color && (key.colorMask & 1u), color && (key.colorMask & 2u), color && (key.colorMask & 4u),
                 color && (key.colorMask & 8u));
     if (depth)
@@ -1102,7 +1340,7 @@ void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
     const uint32_t a = key.alpha & 3u, b = (key.alpha >> 2) & 3u, c = (key.alpha >> 4) & 3u, d = (key.alpha >> 6) & 3u;
     const float fix = static_cast<float>((key.alpha >> 32) & 0xFFu);
     if (c == 1u)
-        ++unsupported; // destination alpha as the factor
+        Note("blend-dest-alpha");
     // Coefficients in terms of f: value = k0 + k1 * f.
     auto coeff = [&](uint32_t which, int &k0, int &k1)
     {
@@ -1137,7 +1375,7 @@ void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
     else
     {
         dstFactor = GL_ONE; // 1 + f cannot be expressed
-        ++unsupported;
+        Note("blend-1+f");
     }
     GLenum equation = GL_FUNC_ADD;
     GLenum srcFactor = srcMode < 0 ? GL_ZERO : GL_ONE;
@@ -1172,6 +1410,240 @@ void GSGpuRenderer::FlushDraws()
     if (m_keyDepth && (m_key.depthMode == 2u || m_key.depthMode == 3u))
         m_keyDepth->gpuNewer = true;
     m_vertices.clear();
+}
+
+void GSGpuRenderer::CopyToSnapshot(FieldSnapshot &snap, const Target &t, uint32_t ox, uint32_t oy, uint32_t w, uint32_t h,
+                                   uint32_t fbp, uint64_t tick)
+{
+    const uint32_t sw = w * m_scale, sh = h * m_scale;
+    if (!snap.tex || snap.w != w || snap.h != h)
+    {
+        if (snap.tex)
+            glDeleteTextures(1, &snap.tex);
+        glGenTextures(1, &snap.tex);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, snap.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glActiveTexture(GL_TEXTURE0);
+    }
+    BlitRect(t.tex, static_cast<int>(ox * m_scale), static_cast<int>(oy * m_scale), static_cast<int>(sw), static_cast<int>(sh), snap.tex, 0, 0,
+             static_cast<int>(sw), static_cast<int>(sh), false);
+    snap.w = w;
+    snap.h = h;
+    snap.fbp = fbp;
+    snap.tick = tick;
+    snap.valid = true;
+}
+
+void GSGpuRenderer::ReadSnapshot(const FieldSnapshot &snap, std::vector<uint8_t> &out)
+{
+    const GLuint staging = Staging(false, snap.w, snap.h);
+    Blit(snap.tex, snap.w * m_scale, snap.h * m_scale, staging, snap.w, snap.h, false);
+    out.resize(static_cast<size_t>(snap.w) * snap.h * 4u);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_blitFbo[1]);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, snap.w, snap.h, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+}
+
+// FieldWeaver::CombEnergy on both orders (green channel, every fourth pixel of odd lines).
+bool GSGpuRenderer::DecideFieldOrder()
+{
+    std::vector<uint8_t> cur, prev;
+    ReadSnapshot(m_cur, cur);
+    ReadSnapshot(m_prev, prev);
+    const uint32_t w = m_cur.w, h = m_cur.h;
+    const size_t rowBytes = static_cast<size_t>(w) * 4u;
+    auto comb = [&](const std::vector<uint8_t> &top, const std::vector<uint8_t> &bottom)
+    {
+        uint64_t energy = 0;
+        for (uint32_t y = 1; y + 1u < h; y += 2u)
+        {
+            const uint8_t *a = top.data() + y * rowBytes;
+            const uint8_t *b = bottom.data() + y * rowBytes;
+            const uint8_t *c = top.data() + (y + 1u) * rowBytes;
+            for (uint32_t x = 1; x < w * 4u; x += 16u)
+                energy += static_cast<uint64_t>(std::abs(2 * b[x] - a[x] - c[x]));
+        }
+        return energy;
+    };
+    return comb(cur, prev) <= comb(prev, cur);
+}
+
+void GSGpuRenderer::RenderOutput(int mode, uint32_t w, uint32_t lines)
+{
+    const uint32_t outW = w * m_scale, outH = (mode == 1 ? 2u * lines : lines) * m_scale;
+    if (!m_outputTex || m_outW != outW || m_outH != outH)
+    {
+        if (m_outputTex)
+            glDeleteTextures(1, &m_outputTex);
+        if (!m_outputFbo)
+            glGenFramebuffers(1, &m_outputFbo);
+        glGenTextures(1, &m_outputTex);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, m_outputTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, outW, outH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glActiveTexture(GL_TEXTURE0);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_outputFbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_outputTex, 0);
+        m_outW = outW;
+        m_outH = outH;
+    }
+    m_haveKey = false;
+    glBindFramebuffer(GL_FRAMEBUFFER, m_outputFbo);
+    glViewport(0, 0, outW, outH);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(m_presentProgram);
+    glUniform1i(glGetUniformLocation(m_presentProgram, "uCur"), 0);
+    glUniform1i(glGetUniformLocation(m_presentProgram, "uPrev"), 1);
+    glUniform1i(glGetUniformLocation(m_presentProgram, "uMode"), mode);
+    glUniform1i(glGetUniformLocation(m_presentProgram, "uCurOnEven"), m_curOnEven ? 1 : 0);
+    glUniform1i(glGetUniformLocation(m_presentProgram, "uScale"), static_cast<GLint>(m_scale));
+    glUniform1i(glGetUniformLocation(m_presentProgram, "uLines"), static_cast<GLint>(lines));
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_cur.tex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, mode == 1 ? m_prev.tex : m_cur.tex);
+    glActiveTexture(GL_TEXTURE0);
+    glBindVertexArray(m_emptyVao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindVertexArray(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void GSGpuRenderer::DumpOutput(uint64_t tick)
+{
+    static const char *dumpDir = std::getenv("PS2X_DUMP_FRAMES");
+    if (!dumpDir || !*dumpDir)
+        return;
+    static const uint32_t dumpEvery = []()
+    {
+        const char *every = std::getenv("PS2X_DUMP_EVERY");
+        const long value = every ? std::strtol(every, nullptr, 10) : 60;
+        return static_cast<uint32_t>(value > 0 ? value : 60);
+    }();
+    if ((m_presentCount % dumpEvery) != 0u)
+        return;
+    std::vector<uint8_t> pixels(static_cast<size_t>(m_outW) * m_outH * 4u);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_outputFbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, m_outW, m_outH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    Image image{};
+    image.data = pixels.data();
+    image.width = static_cast<int>(m_outW);
+    image.height = static_cast<int>(m_outH);
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/frame_%06llu.png", dumpDir, static_cast<unsigned long long>(tick));
+    ExportImage(image, path);
+}
+
+bool GSGpuRenderer::PresentFromGpu(const GSPresentationRequest &request)
+{
+    const bool en1 = (request.pmode & 1u) != 0u, en2 = (request.pmode & 2u) != 0u;
+    const bool same = request.dispfb1 == request.dispfb2 && request.display1 == request.display2;
+    if (en1 == en2 && !(en1 && same))
+    {
+        Note("present-two-circuits");
+        return false;
+    }
+    const uint64_t dispfb = en1 ? request.dispfb1 : request.dispfb2;
+    const uint64_t display = en1 ? request.display1 : request.display2;
+    const uint32_t fbp = static_cast<uint32_t>(dispfb & 0x1FFu), fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
+    const uint32_t psm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
+    const uint32_t ox = static_cast<uint32_t>((dispfb >> 32) & 0x7FFu), oy = static_cast<uint32_t>((dispfb >> 43) & 0x7FFu);
+    // decodeDisplaySize (gs_cpu_backend.cpp)
+    const uint32_t dw = static_cast<uint32_t>((display >> 32) & 0x0FFFu), dh = static_cast<uint32_t>((display >> 44) & 0x07FFu);
+    const uint32_t magh = static_cast<uint32_t>((display >> 23) & 0x0Fu);
+    uint32_t width = (dw + 1u) / (magh + 1u), height = dh + 1u;
+    if (width < 64u || height < 64u)
+        width = 640u, height = 448u;
+    width = std::min<uint32_t>(width, 640u);
+    height = std::min<uint32_t>(height, 512u);
+    if (psm != GS_PSM_CT32 && psm != GS_PSM_CT24)
+    {
+        Note("present-psm");
+        return false;
+    }
+    if (request.hasPreferredSource && request.preferredDestFbp == fbp)
+    {
+        Note("present-preferred-source");
+        return false;
+    }
+    Target *target = nullptr;
+    for (auto &t : m_targets)
+        if (!t->depth && t->fbp == fbp && t->fbw == fbw)
+            target = t.get();
+    if (!target || ox + width > target->width || oy + height > target->height)
+        return false; // not drawn on the GPU (movies, uploads): the CPU path reads GS memory
+    FlushDraws();
+    if (target->vramNewer)
+        UploadTarget(*target);
+
+    static const bool s_deinterlace = []()
+    {
+        const char *v = std::getenv("PS2X_DEINTERLACE");
+        return !(v && v[0] == '0');
+    }();
+    const uint64_t tick = request.vsyncTick;
+    if (!s_deinterlace || height > 256u)
+    {
+        CopyToSnapshot(m_cur, *target, ox, oy, width, height, fbp, tick);
+        m_prev.valid = false;
+        RenderOutput(0, width, height);
+    }
+    else
+    {
+        const bool sameShape = m_cur.valid && m_cur.w == width && m_cur.h == height;
+        if (!sameShape || fbp != m_cur.fbp)
+        {
+            if (sameShape)
+                std::swap(m_cur, m_prev);
+            else
+                m_prev.valid = false;
+            CopyToSnapshot(m_cur, *target, ox, oy, width, height, fbp, tick);
+            if (m_prev.valid && (m_newFields++ % 16u) == 0u)
+                m_curOnEven = DecideFieldOrder();
+        }
+        else
+        {
+            const uint64_t heldSince = m_cur.tick;
+            CopyToSnapshot(m_cur, *target, ox, oy, width, height, fbp, heldSince);
+        }
+        const bool weave = m_prev.valid && tick - m_cur.tick <= 8u;
+        RenderOutput(weave ? 1 : 0, width, height);
+    }
+    ++m_presentCount;
+    DumpOutput(tick);
+    m_presentValid = true;
+    return true;
+}
+
+void GSGpuRenderer::DrawPresentation(float x, float y, float w, float h)
+{
+    if (!m_presentValid || !m_outputTex)
+        return;
+    Texture2D tex{};
+    tex.id = m_outputTex;
+    tex.width = static_cast<int>(m_outW);
+    tex.height = static_cast<int>(m_outH);
+    tex.mipmaps = 1;
+    tex.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    DrawTexturePro(tex, Rectangle{0.0f, 0.0f, static_cast<float>(m_outW), static_cast<float>(m_outH)}, Rectangle{x, y, w, h},
+                   Vector2{0.0f, 0.0f}, 0.0f, WHITE);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1230,12 +1702,16 @@ void GSGpuBackend::PublishLocked()
 
 void GSGpuBackend::Enqueue(Command &&command)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::mutex> lock(m_mutex);
     const bool publish = command.type != CommandType::Submit;
     m_pending.push_back(std::move(command));
     ++m_queued;
     if (publish || m_pending.size() >= 512u)
+    {
         PublishLocked();
+        if (m_ready.size() > kMaxReadyBatches && m_hostStarted.load(std::memory_order_acquire) && !OnHostThread())
+            m_doneCv.wait(lock, [&]() { return m_ready.size() <= kMaxReadyBatches / 2u || m_stopped; });
+    }
 }
 
 void GSGpuBackend::RunOnHost(const std::function<void()> &fn) const
@@ -1276,7 +1752,8 @@ void GSGpuBackend::RunOnHost(const std::function<void()> &fn) const
         return;
     Command command;
     command.type = CommandType::Call;
-    command.call = fn;
+    command.extra = std::make_unique<CommandExtra>();
+    command.extra->call = fn;
     self->m_pending.push_back(std::move(command));
     const uint64_t target = ++self->m_queued;
     self->PublishLocked();
@@ -1323,6 +1800,16 @@ void GSGpuBackend::PumpHostThread(std::chrono::steady_clock::time_point deadline
     m_renderer->EndHostWork();
 }
 
+bool GSGpuBackend::HasPresentation() const
+{
+    return m_renderer->HasPresentation();
+}
+
+void GSGpuBackend::DrawPresentation(float x, float y, float w, float h)
+{
+    m_renderer->DrawPresentation(x, y, w, h);
+}
+
 void GSGpuBackend::ShutdownHostThread()
 {
     {
@@ -1331,6 +1818,7 @@ void GSGpuBackend::ShutdownHostThread()
     }
     m_doneCv.notify_all();
     m_workCv.notify_all();
+    std::cerr << "[gs-gpu] not reproduced exactly:" << m_renderer->UnsupportedSummary() << std::endl;
     m_renderer->Release();
 }
 
@@ -1347,16 +1835,16 @@ void GSGpuBackend::Execute(Command &command)
     case CommandType::LoadClut:
     {
         uint32_t first, count;
-        pageSpan(command.tex0.cpsm, command.tex0.cbp, 1u, 0u, 16u, first, count);
+        pageSpan(command.extra->tex0.cpsm, command.extra->tex0.cbp, 1u, 0u, 16u, first, count);
         r.DownloadOverlapping(first, count);
-        m_cpu.LoadClut(command.tex0, command.texclut);
+        m_cpu.LoadClut(command.extra->tex0, command.extra->texclut);
         if (m_shadow)
-            m_shadow->LoadClut(command.tex0, command.texclut);
+            m_shadow->LoadClut(command.extra->tex0, command.extra->texclut);
         break;
     }
     case CommandType::BeginTransfer:
     {
-        const GSTransferCommand &t = command.transfer;
+        const GSTransferCommand &t = command.extra->transfer;
         r.FlushDraws();
         if (t.direction == 1u || t.direction == 2u)
         {
@@ -1371,8 +1859,8 @@ void GSGpuBackend::Execute(Command &command)
         m_cpu.BeginTransfer(t);
         if (t.direction == 2u)
             r.InvalidatePages(first, count);
-        command.args[0] = first;
-        command.args[1] = count;
+        command.extra->args[0] = first;
+        command.extra->args[1] = count;
         m_transferFirstPage = first;
         m_transferPageCount = count;
         if (m_shadow)
@@ -1380,10 +1868,10 @@ void GSGpuBackend::Execute(Command &command)
         break;
     }
     case CommandType::UploadImage:
-        m_cpu.UploadImage(command.data.data(), static_cast<uint32_t>(command.data.size()));
+        m_cpu.UploadImage(command.extra->data.data(), static_cast<uint32_t>(command.extra->data.size()));
         r.InvalidatePages(m_transferFirstPage, m_transferPageCount);
         if (m_shadow)
-            m_shadow->UploadImage(command.data.data(), static_cast<uint32_t>(command.data.size()));
+            m_shadow->UploadImage(command.extra->data.data(), static_cast<uint32_t>(command.extra->data.size()));
         break;
     case CommandType::TextureFlush:
         m_cpu.TextureFlush();
@@ -1393,19 +1881,32 @@ void GSGpuBackend::Execute(Command &command)
     case CommandType::WriteVram:
     {
         r.DownloadAll();
-        m_cpu.WriteVram(command.args[0], command.args[1], command.args[2], command.args[3], command.args[4], command.args[5]);
+        m_cpu.WriteVram(command.extra->args[0], command.extra->args[1], command.extra->args[2], command.extra->args[3], command.extra->args[4], command.extra->args[5]);
         r.InvalidateAll();
         if (m_shadow)
-            m_shadow->WriteVram(command.args[0], command.args[1], command.args[2], command.args[3], command.args[4], command.args[5]);
+            m_shadow->WriteVram(command.extra->args[0], command.extra->args[1], command.extra->args[2], command.extra->args[3], command.extra->args[4], command.extra->args[5]);
         break;
     }
     case CommandType::Present:
     {
-        r.DownloadAll();
-        PresentationFrame frame = m_cpu.Present(command.presentRequest);
+        static const bool s_gpuPresent = []()
+        {
+            const char *v = std::getenv("PS2X_GS_GPU_PRESENT");
+            return !(v && v[0] == '0');
+        }();
+        if (s_gpuPresent && !m_shadow && r.PresentFromGpu(command.extra->presentRequest))
+        {
+            m_presentPending.store(false, std::memory_order_release);
+            if (command.extra->presentCallback)
+                command.extra->presentCallback(PresentationFrame{});
+            break;
+        }
+        r.InvalidatePresentation();
+        r.DownloadForPresent(command.extra->presentRequest);
+        PresentationFrame frame = m_cpu.Present(command.extra->presentRequest);
         if (m_shadow)
         {
-            PresentationFrame reference = m_shadow->Present(command.presentRequest);
+            PresentationFrame reference = m_shadow->Present(command.extra->presentRequest);
             if (frame && reference && frame.width == reference.width && frame.height == reference.height)
             {
                 uint64_t sum = 0, bad = 0;
@@ -1424,19 +1925,26 @@ void GSGpuBackend::Execute(Command &command)
                 if (bad > n / 400u)
                     ++g_verify.badFrames;
                 const auto now = std::chrono::steady_clock::now();
-                if (now - g_verify.lastReport > std::chrono::seconds(5))
+                static const long s_dumpTick = []()
+                {
+                    const char *v = std::getenv("PS2X_GS_GPU_VERIFY_TICK");
+                    return v ? std::strtol(v, nullptr, 0) : -1L;
+                }();
+                const bool dumpThis = s_dumpTick >= 0 && command.extra->presentRequest.vsyncTick >= static_cast<uint64_t>(s_dumpTick) &&
+                                      command.extra->presentRequest.vsyncTick < static_cast<uint64_t>(s_dumpTick) + 4u;
+                if (dumpThis || now - g_verify.lastReport > std::chrono::seconds(5))
                 {
                     g_verify.lastReport = now;
                     std::cerr << "[gs-gpu-verify] frames=" << g_verify.frames << " mean|diff|="
                               << (g_verify.sumMeanAbs / static_cast<double>(g_verify.frames)) << " frames>0.25%bad="
-                              << g_verify.badFrames << " last=" << meanAbs << " unsupported=" << r.unsupported << std::endl;
+                              << g_verify.badFrames << " last=" << meanAbs << " unsupported:" << r.UnsupportedSummary() << std::endl;
                     static const char *dumpDir = std::getenv("PS2X_DUMP_FRAMES");
                     if (dumpDir && *dumpDir)
                     {
                         // Side by side: GPU | CPU | amplified difference, as a binary PPM.
                         char path[512];
                         std::snprintf(path, sizeof(path), "%s/gpu_verify_%06llu.ppm", dumpDir,
-                                      static_cast<unsigned long long>(command.presentRequest.vsyncTick));
+                                      static_cast<unsigned long long>(command.extra->presentRequest.vsyncTick));
                         if (FILE *f = std::fopen(path, "wb"))
                         {
                             std::fprintf(f, "P6\n%u %u\n255\n", frame.width * 3u, frame.height);
@@ -1459,13 +1967,13 @@ void GSGpuBackend::Execute(Command &command)
             }
         }
         m_presentPending.store(false, std::memory_order_release);
-        if (command.presentCallback)
-            command.presentCallback(std::move(frame));
+        if (command.extra->presentCallback)
+            command.extra->presentCallback(std::move(frame));
         break;
     }
     case CommandType::Call:
-        if (command.call)
-            command.call();
+        if (command.extra->call)
+            command.extra->call();
         break;
     }
 }
@@ -1508,8 +2016,9 @@ void GSGpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
     Command command;
     command.type = CommandType::LoadClut;
-    command.tex0 = tex0;
-    command.texclut = texclut;
+    command.extra = std::make_unique<CommandExtra>();
+    command.extra->tex0 = tex0;
+    command.extra->texclut = texclut;
     Enqueue(std::move(command));
 }
 
@@ -1517,7 +2026,8 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &transferCommand)
 {
     Command command;
     command.type = CommandType::BeginTransfer;
-    command.transfer = transferCommand;
+    command.extra = std::make_unique<CommandExtra>();
+    command.extra->transfer = transferCommand;
     Enqueue(std::move(command));
 }
 
@@ -1525,7 +2035,8 @@ void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     Command command;
     command.type = CommandType::UploadImage;
-    command.data.assign(data, data + sizeBytes);
+    command.extra = std::make_unique<CommandExtra>();
+    command.extra->data.assign(data, data + sizeBytes);
     Enqueue(std::move(command));
 }
 
@@ -1566,8 +2077,9 @@ bool GSGpuBackend::PresentAsync(const GSPresentationRequest &request, PresentCal
         return false;
     Command command;
     command.type = CommandType::Present;
-    command.presentRequest = request;
-    command.presentCallback = std::move(callback);
+    command.extra = std::make_unique<CommandExtra>();
+    command.extra->presentRequest = request;
+    command.extra->presentCallback = std::move(callback);
     Enqueue(std::move(command));
     return true;
 }
@@ -1613,12 +2125,13 @@ void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t 
 {
     Command command;
     command.type = CommandType::WriteVram;
-    command.args[0] = psm;
-    command.args[1] = base;
-    command.args[2] = bw;
-    command.args[3] = x;
-    command.args[4] = y;
-    command.args[5] = value;
+    command.extra = std::make_unique<CommandExtra>();
+    command.extra->args[0] = psm;
+    command.extra->args[1] = base;
+    command.extra->args[2] = bw;
+    command.extra->args[3] = x;
+    command.extra->args[4] = y;
+    command.extra->args[5] = value;
     Enqueue(std::move(command));
 }
 

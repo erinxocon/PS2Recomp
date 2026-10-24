@@ -2652,7 +2652,9 @@ void PS2Runtime::run()
 
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        const bool gpuFrame = gpuBackend && gpuBackend->HasPresentation();
+        if (!gpuFrame)
+            UploadFrame(frameTex, this, presentWidth, presentHeight);
 
         BeginDrawing();
         ClearBackground(BLACK);
@@ -2676,7 +2678,10 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        if (gpuFrame)
+            gpuBackend->DrawPresentation(dstRect.x, dstRect.y, dstRect.width, dstRect.height);
+        else
+            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);

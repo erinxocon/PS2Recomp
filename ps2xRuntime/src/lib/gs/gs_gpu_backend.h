@@ -65,6 +65,11 @@ public:
     // pending and later synchronous calls return without results.
     void ShutdownHostThread();
 
+    // Host thread: whether the last presented frame came from the GPU, and drawing it (inside
+    // raylib's BeginDrawing/EndDrawing) into the given window rectangle.
+    bool HasPresentation() const;
+    void DrawPresentation(float x, float y, float w, float h);
+
     static bool Requested();
 
 private:
@@ -80,10 +85,9 @@ private:
         Call,
     };
 
-    struct Command
+    // Everything but draws is rare; keep its payload out of line so queued draws stay small.
+    struct CommandExtra
     {
-        CommandType type = CommandType::TextureFlush;
-        GSPrimitiveBatch batch{};
         GSTex0Reg tex0{};
         GSTexClutReg texclut{};
         GSTransferCommand transfer{};
@@ -93,6 +97,17 @@ private:
         PresentCallback presentCallback;
         std::function<void()> call;
     };
+
+    struct Command
+    {
+        CommandType type = CommandType::TextureFlush;
+        GSPrimitiveBatch batch{};
+        std::unique_ptr<CommandExtra> extra;
+    };
+
+    // Queued batches beyond which the guest waits for the host (bounds memory when the host falls
+    // behind, e.g. with verification on).
+    static constexpr size_t kMaxReadyBatches = 64;
 
     void Enqueue(Command &&command);
     void PublishLocked();
