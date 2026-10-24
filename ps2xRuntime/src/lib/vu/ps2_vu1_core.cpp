@@ -7,6 +7,7 @@
 #include "ps2_vu1_lifted.h"
 
 #include <algorithm>
+#include <bit>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -1201,7 +1202,7 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
             }
         }
         for (uint32_t mask = usage->viRead & 0xFFFEu; mask != 0u; mask &= mask - 1u)
-            ready = std::max(ready, m_viReady[static_cast<uint32_t>(__builtin_ctz(mask))]);
+            ready = std::max(ready, m_viReady[static_cast<uint32_t>(std::countr_zero(mask))]);
         if (usage->accRead != 0u)
         {
             for (uint32_t component = 0; component < 4u; ++component)
@@ -1262,7 +1263,7 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
     {
         const uint64_t viReady = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
         for (uint32_t mask = viWrite; mask != 0u; mask &= mask - 1u)
-            m_viReady[static_cast<uint32_t>(__builtin_ctz(mask))] = viReady;
+            m_viReady[static_cast<uint32_t>(std::countr_zero(mask))] = viReady;
     }
     if (decoded.upperUsage.accWrite != 0u)
     {
@@ -1944,7 +1945,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         int32_t oldVi = 0;
         if (const uint32_t viWrite = decoded.lowerUsage.viWrite & 0xFFFEu; viWrite != 0u)
         {
-            writtenVi = static_cast<uint8_t>(__builtin_ctz(viWrite));
+            writtenVi = static_cast<uint8_t>(std::countr_zero(viWrite));
             oldVi = m_state.vi[writtenVi];
         }
 
