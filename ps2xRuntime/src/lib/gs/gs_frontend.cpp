@@ -10,6 +10,12 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "gs_threaded_backend.h"
 
@@ -57,6 +63,115 @@ namespace
         }
         std::cout << line.str() << std::endl;
     }
+}
+
+namespace
+{
+    // PS2X_GS_CENSUS=<file> keeps histograms of the GS features the game uses (draw state, render
+    // to texture, transfers) and rewrites <file> every few seconds. Used to scope the GPU backend.
+    class GSCensus
+    {
+    public:
+        static GSCensus *instance()
+        {
+            static GSCensus *s_census = []() -> GSCensus *
+            {
+                const char *path = std::getenv("PS2X_GS_CENSUS");
+                return (path && *path) ? new GSCensus(path) : nullptr;
+            }();
+            return s_census;
+        }
+
+        void draw(const GSPrimitiveBatch &batch)
+        {
+            const GSDrawState &st = batch.state;
+            const GSContext &c = st.context;
+            std::lock_guard<std::mutex> lock(m_mutex);
+            ++m_draws;
+            const uint64_t a = c.alpha, t = c.test;
+            bump("prim", std::to_string(int(st.prim.type)) + (st.prim.tme ? " tex" : "") + (st.prim.abe ? " blend" : "") +
+                             (st.prim.fge ? " fog" : "") + (st.prim.iip ? "" : " flat") + (st.prim.tme && st.prim.fst ? " uv" : "") +
+                             (st.prim.aa1 ? " aa1" : ""));
+            if (st.prim.abe)
+                bump("alpha A B C D (fix)", std::to_string(a & 3) + " " + std::to_string((a >> 2) & 3) + " " + std::to_string((a >> 4) & 3) + " " +
+                                                std::to_string((a >> 6) & 3) + (((a >> 4) & 3) == 2 ? " fix=" + std::to_string((a >> 32) & 0xFF) : ""));
+            bump("test ate atst afail | date datm | zte ztst", std::to_string(t & 1) + " " + std::to_string((t >> 1) & 7) + " " + std::to_string((t >> 12) & 3) +
+                                                                  " | " + std::to_string((t >> 14) & 1) + " " + std::to_string((t >> 15) & 1) + " | " +
+                                                                  std::to_string((t >> 16) & 1) + " " + std::to_string((t >> 17) & 3));
+            bump("frame psm fbw fbmsk", std::to_string(int(c.frame.psm)) + " " + std::to_string(c.frame.fbw) + " " + hex(c.frame.fbmsk));
+            bump("zbuf psm zmsk", std::to_string(int(c.zbuf.psm)) + " " + std::to_string(int(c.zbuf.zmask)));
+            if (st.prim.tme)
+            {
+                bump("tex psm cpsm csm tw th tcc tfx", std::to_string(int(c.tex0.psm)) + " " + std::to_string(int(c.tex0.cpsm)) + " " + std::to_string(int(c.tex0.csm)) +
+                                                           " " + std::to_string(1 << c.tex0.tw) + "x" + std::to_string(1 << c.tex0.th) + " " +
+                                                           std::to_string(int(c.tex0.tcc)) + " " + std::to_string(int(c.tex0.tfx)));
+                bump("clamp wms wmt | tex1 mxl mmag mmin", std::to_string(c.clamp & 3) + " " + std::to_string((c.clamp >> 2) & 3) + " | " +
+                                                              std::to_string((c.tex1 >> 2) & 7) + " " + std::to_string((c.tex1 >> 5) & 1) + " " +
+                                                              std::to_string((c.tex1 >> 6) & 7));
+                // Texture inside a buffer drawn to recently (pages of 8 KiB; TBP is in 256-byte blocks).
+                const uint32_t texPage = c.tex0.tbp0 / 32u;
+                if (m_drawnPages.count(texPage))
+                    bump("render-to-texture tex psm <- frame psm", std::to_string(int(c.tex0.psm)) + " <- " + std::to_string(m_drawnPages[texPage]));
+            }
+            bump("colclamp dthe pabe fba", std::to_string(st.colclamp & 1) + " " + std::to_string(st.dthe & 1) + " " + std::to_string(int(st.pabe)) + " " +
+                                               std::to_string(c.fba & 1));
+            m_drawnPages[c.frame.fbp] = c.frame.psm;
+            maybeWrite();
+        }
+
+        void transfer(const GSTransferCommand &command)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const GSBitBltBuf &b = command.bitbltbuf;
+            const uint32_t w = command.trxreg.rrw, h = command.trxreg.rrh;
+            const char *dir[] = {"host->local", "local->host", "local->local", "off"};
+            bump("transfer dir psm", std::string(dir[command.direction & 3]) + " " +
+                                         std::to_string(int(command.direction == 1 ? b.spsm : b.dpsm)) +
+                                         (w * h >= 64 * 64 ? " large" : " small"));
+        }
+
+    private:
+        explicit GSCensus(const char *path) : m_path(path) {}
+
+        static std::string hex(uint32_t v)
+        {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%08x", v);
+            return buf;
+        }
+
+        void bump(const char *group, const std::string &key) { ++m_counts[group][key]; }
+
+        void maybeWrite()
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - m_lastWrite < std::chrono::seconds(5))
+                return;
+            m_lastWrite = now;
+            if (FILE *f = std::fopen(m_path.c_str(), "w"))
+            {
+                std::fprintf(f, "draws %llu\n", static_cast<unsigned long long>(m_draws));
+                for (const auto &[group, counts] : m_counts)
+                {
+                    std::vector<std::pair<uint64_t, std::string>> sorted;
+                    for (const auto &[key, n] : counts)
+                        sorted.emplace_back(n, key);
+                    std::sort(sorted.rbegin(), sorted.rend());
+                    std::fprintf(f, "\n[%s]\n", group.c_str());
+                    for (const auto &[n, key] : sorted)
+                        std::fprintf(f, "%12llu  %s\n", static_cast<unsigned long long>(n), key.c_str());
+                }
+                std::fclose(f);
+            }
+        }
+
+        std::string m_path;
+        std::mutex m_mutex;
+        uint64_t m_draws = 0;
+        std::map<std::string, std::map<std::string, uint64_t>> m_counts;
+        std::unordered_map<uint32_t, uint8_t> m_drawnPages;
+        std::chrono::steady_clock::time_point m_lastWrite{};
+    };
 }
 
 namespace
@@ -1611,6 +1726,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
                           << std::endl;
             }
             m_traceCounters.lastTransferDbp.store(static_cast<uint32_t>(m_bitbltbuf.dbp), std::memory_order_relaxed);
+            if (GSCensus *census = GSCensus::instance())
+                census->transfer(command);
             m_backend->BeginTransfer(command);
         }
         recordTransferDebugEventUnlocked();
@@ -1801,6 +1918,8 @@ void GS::vertexKick(bool drawing)
         traceDrawIfRequested(batch, m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_relaxed) : 0u);
         m_traceCounters.lastDrawFbp.store(batch.state.context.frame.fbp, std::memory_order_relaxed);
         m_traceCounters.lastDrawPrim.store(static_cast<uint32_t>(m_prim.type), std::memory_order_relaxed);
+        if (GSCensus *census = GSCensus::instance())
+            census->draw(batch);
         m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
