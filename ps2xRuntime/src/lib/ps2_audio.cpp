@@ -121,7 +121,7 @@ namespace
 
     private:
         static constexpr size_t kSampleRate = ps2x::iop::kSpu2SampleRate;
-        static constexpr double kMaxExcessMs = 80.0;
+        static constexpr double kMaxExcessMs = 30.0;
         static constexpr double kMaxRateAdjust = 0.005;
 
         // PS2X_AUDIO_LATENCY_MS: audio buffered ahead of the device (default 40; raise it if it crackles).
