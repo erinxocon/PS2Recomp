@@ -398,6 +398,7 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/vu/ps2_vu1_census.cpp
     src/lib/vu/ps2_vu1_lifted.cpp
+    src/lib/vu/ps2_vu1_native.cpp
     src/lib/games_database.cpp
 )
 
@@ -409,6 +410,7 @@ set_source_files_properties(
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/vu/ps2_vu1_lifted.cpp
+    src/lib/vu/ps2_vu1_native.cpp
     PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 # Debug info for the VU1/GS hot paths only, for line-level perf profiles without rebuilding the
@@ -420,6 +422,7 @@ if(PS2X_PROFILE_DEBUGINFO)
         src/lib/vu/ps2_vu1_upper.cpp
         src/lib/vu/ps2_vu1_lower.cpp
         src/lib/vu/ps2_vu1_lifted.cpp
+        src/lib/vu/ps2_vu1_native.cpp
         src/lib/gs/gs_cpu_backend.cpp
         src/lib/gs/ps2_gs_memory.cpp
         APPEND PROPERTY COMPILE_OPTIONS "-g")
