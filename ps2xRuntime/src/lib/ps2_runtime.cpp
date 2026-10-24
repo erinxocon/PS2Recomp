@@ -52,6 +52,12 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
 static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
 #endif
+// Host window size to apply once the window is shown (see the InitWindow call).
+static int g_pendingWindowWidth = 0;
+static int g_pendingWindowHeight = 0;
+static int g_framesShown = 0;
+static bool g_windowSizeFixed = false;
+
 struct ElfHeader
 {
     uint32_t magic;
@@ -891,13 +897,35 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        // Window: 960 lines (the GPU renderer's 2x) in the display aspect (PS2X_ASPECT=W:H), or
+        // PS2X_WINDOW=WxH. Created at that size, since some window managers ignore later resizes;
+        // shrunk to 85% of the monitor's height if needed.
         if (const char *aspect = std::getenv("PS2X_ASPECT"))
         {
             float w = 0.0f, h = 0.0f;
             if (std::sscanf(aspect, "%f:%f", &w, &h) == 2 && w > 0.0f && h > 0.0f)
                 setDisplayAspect(w / h);
+        }
+        int windowWidth = 0, windowHeight = 0;
+        const char *windowSize = std::getenv("PS2X_WINDOW");
+        if (windowSize && std::sscanf(windowSize, "%dx%d", &windowWidth, &windowHeight) == 2 && windowWidth > 0 &&
+            windowHeight > 0)
+            g_windowSizeFixed = true;
+        else
+        {
+            windowHeight = 960;
+            windowWidth = static_cast<int>(static_cast<float>(windowHeight) * m_displayAspect + 0.5f);
+        }
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        InitWindow(windowWidth, windowHeight, title);
+        if (!g_windowSizeFixed)
+        {
+            const int monitorHeight = GetMonitorHeight(GetCurrentMonitor());
+            if (monitorHeight > 0 && windowHeight > monitorHeight * 85 / 100)
+            {
+                g_pendingWindowHeight = monitorHeight * 85 / 100;
+                g_pendingWindowWidth = static_cast<int>(static_cast<float>(g_pendingWindowHeight) * m_displayAspect + 0.5f);
+            }
         }
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
@@ -1259,10 +1287,14 @@ void PS2Runtime::setDisplayAspect(float aspect)
     if (!(aspect > 0.1f && aspect < 10.0f))
         return;
     m_displayAspect = aspect;
-    if (IsWindowReady())
+    if (!g_windowSizeFixed)
     {
-        const int height = GetScreenHeight();
-        SetWindowSize(static_cast<int>(static_cast<float>(height) * aspect + 0.5f), height);
+        const int height = g_pendingWindowHeight > 0 ? g_pendingWindowHeight : (IsWindowReady() ? GetScreenHeight() : 0);
+        if (height > 0 && IsWindowReady())
+        {
+            g_pendingWindowHeight = height;
+            g_pendingWindowWidth = static_cast<int>(static_cast<float>(height) * aspect + 0.5f);
+        }
     }
 }
 
@@ -2709,7 +2741,16 @@ void PS2Runtime::run()
         }
         EndDrawing();
         m_padBackend.updateGamepads();
-
+        ++g_framesShown;
+        if (g_pendingWindowWidth > 0 && g_framesShown > 2)
+        {
+            const int monitor = GetCurrentMonitor();
+            SetWindowSize(g_pendingWindowWidth, g_pendingWindowHeight);
+            if (GetMonitorWidth(monitor) > g_pendingWindowWidth && GetMonitorHeight(monitor) > g_pendingWindowHeight)
+                SetWindowPosition((GetMonitorWidth(monitor) - g_pendingWindowWidth) / 2,
+                                  (GetMonitorHeight(monitor) - g_pendingWindowHeight) / 2);
+            g_pendingWindowWidth = g_pendingWindowHeight = 0;
+        }
         if (WindowShouldClose())
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
