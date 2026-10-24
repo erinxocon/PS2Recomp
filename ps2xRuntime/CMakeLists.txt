@@ -396,20 +396,32 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/vu/ps2_vu1_census.cpp
+    src/lib/vu/ps2_vu1_lifted.cpp
     src/lib/games_database.cpp
 )
+
+# The VU has no fused multiply-add: MADD/MSUB round the product and the sum separately. Keep the
+# compiler from contracting a*b+c into an FMA (which -march=native would otherwise allow), so VU
+# results are the same on every CPU and the lifted microcode matches the interpreter bit for bit.
+set_source_files_properties(
+    src/lib/vu/ps2_vu1_core.cpp
+    src/lib/vu/ps2_vu1_upper.cpp
+    src/lib/vu/ps2_vu1_lower.cpp
+    src/lib/vu/ps2_vu1_lifted.cpp
+    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 # Debug info for the VU1/GS hot paths only, for line-level perf profiles without rebuilding the
 # generated game code.
 option(PS2X_PROFILE_DEBUGINFO "Compile the VU1 and GS sources with -g" OFF)
 if(PS2X_PROFILE_DEBUGINFO)
-    set_source_files_properties(
+    set_property(SOURCE
         src/lib/vu/ps2_vu1_core.cpp
         src/lib/vu/ps2_vu1_upper.cpp
         src/lib/vu/ps2_vu1_lower.cpp
+        src/lib/vu/ps2_vu1_lifted.cpp
         src/lib/gs/gs_cpu_backend.cpp
         src/lib/gs/ps2_gs_memory.cpp
-        PROPERTIES COMPILE_OPTIONS "-g")
+        APPEND PROPERTY COMPILE_OPTIONS "-g")
 endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)

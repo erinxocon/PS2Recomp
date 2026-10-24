@@ -2,23 +2,24 @@
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
-#include <immintrin.h>
 #include <cstring>
 #include <limits>
 
 namespace
 {
     // normalizeOperand() for four lanes: denormals become signed zero, Inf/NaN become signed FLT_MAX.
+    // Plain integer ops on the bit patterns, so the compiler can vectorize it on any target.
     inline void normalizeOperands4(const float *in, float *out)
     {
-        __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(in));
-        const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
-        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
-        const __m128i isZeroExp = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
-        const __m128i isMaxExp = _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000));
-        bits = _mm_blendv_epi8(bits, sign, isZeroExp);
-        bits = _mm_blendv_epi8(bits, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)), isMaxExp);
-        _mm_storeu_si128(reinterpret_cast<__m128i *>(out), bits);
+        uint32_t bits[4];
+        std::memcpy(bits, in, sizeof(bits));
+        for (uint32_t &b : bits)
+        {
+            const uint32_t exponent = b & 0x7F800000u;
+            const uint32_t sign = b & 0x80000000u;
+            b = exponent == 0u ? sign : exponent == 0x7F800000u ? (sign | 0x7F7FFFFFu) : b;
+        }
+        std::memcpy(out, bits, sizeof(bits));
     }
 
     int32_t vuFloatToInt(float value, float scale)
