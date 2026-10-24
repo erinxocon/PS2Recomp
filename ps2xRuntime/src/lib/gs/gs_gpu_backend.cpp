@@ -240,8 +240,9 @@ void main()
 
     // Builds the displayed picture from field snapshots (rows of the target are GS lines, row 0 first).
     // Mode 0 copies the current snapshot; mode 1 weaves the current and previous field (GS field
-    // rendering: two half-height buffers a line apart) like the CPU FieldWeaver, expanding each
-    // logical line to uScale rows and repairing combing on the older field's lines.
+    // rendering: two half-height buffers a line apart) like the CPU FieldWeaver, for 1x; mode 2 is
+    // for upscaled fields, which are whole pictures at more lines than a woven frame: the newest
+    // field alone, the lower field moved up half a line so consecutive fields line up.
     const char *kPresentFragmentShader = R"(#version 330
 uniform sampler2D uCur;
 uniform sampler2D uPrev;
@@ -249,6 +250,7 @@ uniform int uMode;
 uniform int uCurOnEven;
 uniform int uScale;
 uniform int uLines;
+uniform float uShift;           // mode 2: rows to move the field up (half a line for the lower field)
 out vec4 oColor;
 void main()
 {
@@ -256,6 +258,12 @@ void main()
     if (uMode == 0)
     {
         oColor = vec4(texelFetch(uCur, p, 0).rgb, 1.0);
+        return;
+    }
+    if (uMode == 2)
+    {
+        vec2 size = vec2(textureSize(uCur, 0));
+        oColor = vec4(texture(uCur, (gl_FragCoord.xy + vec2(0.0, uShift)) / size).rgb, 1.0);
         return;
     }
     int line = p.y / uScale;
@@ -327,8 +335,8 @@ public:
     void FlushDraws();
 
     // Make GS memory current for pages [first, first + count) (or all of it).
-    void DownloadOverlapping(uint32_t first, uint32_t count);
-    void DownloadAll();
+    void DownloadOverlapping(uint32_t first, uint32_t count, const char *why = "other");
+    void DownloadAll(const char *why = "other");
     // Colour buffers presentation may read (display buffers, the last draw targets).
     void DownloadForPresent(const GSPresentationRequest &request);
     // GS memory in [first, first + count) was written by someone else.
@@ -669,19 +677,25 @@ static bool rangesOverlap(uint32_t a, uint32_t an, uint32_t b, uint32_t bn)
     return a < b + bn && b < a + an;
 }
 
-void GSGpuRenderer::DownloadOverlapping(uint32_t first, uint32_t count)
+void GSGpuRenderer::DownloadOverlapping(uint32_t first, uint32_t count, const char *why)
 {
     for (auto &t : m_targets)
         if (t->gpuNewer && rangesOverlap(t->firstPage, t->pageCount, first, count))
+        {
+            ++unsupported[std::string("download:") + why];
             DownloadTarget(*t);
+        }
 }
 
-void GSGpuRenderer::DownloadAll()
+void GSGpuRenderer::DownloadAll(const char *why)
 {
     FlushDraws();
     for (auto &t : m_targets)
         if (t->gpuNewer)
+        {
+            ++unsupported[std::string("download:") + why];
             DownloadTarget(*t);
+        }
 }
 
 void GSGpuRenderer::DownloadForPresent(const GSPresentationRequest &request)
@@ -817,6 +831,7 @@ GSGpuRenderer::Target *GSGpuRenderer::FindOrCreateTarget(uint32_t fbp, uint32_t 
 
 void GSGpuRenderer::UploadTarget(Target &t)
 {
+    Note("upload");
     const uint32_t n = t.width * t.height;
     m_scratch.resize(n);
     m_cpu.ReadRect(t.psm, t.fbp * 32u, t.fbw, 0, 0, t.width, t.height, m_scratch.data());
@@ -972,7 +987,7 @@ GSGpuRenderer::Texture *GSGpuRenderer::GetTexture(const GSDrawState &state)
     // Render to texture: write back any target drawn over these pages first.
     uint32_t first, count;
     pageSpan(tex0.psm, tex0.tbp0, tex0.tbw, 0u, h, first, count);
-    DownloadOverlapping(first, count);
+    DownloadOverlapping(first, count, "texture");
 
     uint32_t pw, ph;
     pageSize(tex0.psm, pw, ph);
@@ -1424,8 +1439,10 @@ void GSGpuRenderer::CopyToSnapshot(FieldSnapshot &snap, const Target &t, uint32_
         glActiveTexture(GL_TEXTURE3);
         glBindTexture(GL_TEXTURE_2D, snap.tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glActiveTexture(GL_TEXTURE0);
     }
     BlitRect(t.tex, static_cast<int>(ox * m_scale), static_cast<int>(oy * m_scale), static_cast<int>(sw), static_cast<int>(sh), snap.tex, 0, 0,
@@ -1510,6 +1527,7 @@ void GSGpuRenderer::RenderOutput(int mode, uint32_t w, uint32_t lines)
     glUniform1i(glGetUniformLocation(m_presentProgram, "uCurOnEven"), m_curOnEven ? 1 : 0);
     glUniform1i(glGetUniformLocation(m_presentProgram, "uScale"), static_cast<GLint>(m_scale));
     glUniform1i(glGetUniformLocation(m_presentProgram, "uLines"), static_cast<GLint>(lines));
+    glUniform1f(glGetUniformLocation(m_presentProgram, "uShift"), m_curOnEven ? 0.0f : 0.5f * static_cast<float>(m_scale));
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, m_cur.tex);
     glActiveTexture(GL_TEXTURE1);
@@ -1623,8 +1641,8 @@ bool GSGpuRenderer::PresentFromGpu(const GSPresentationRequest &request)
             const uint64_t heldSince = m_cur.tick;
             CopyToSnapshot(m_cur, *target, ox, oy, width, height, fbp, heldSince);
         }
-        const bool weave = m_prev.valid && tick - m_cur.tick <= 8u;
-        RenderOutput(weave ? 1 : 0, width, height);
+        const bool pair = m_prev.valid && tick - m_cur.tick <= 8u;
+        RenderOutput(pair ? (m_scale == 1u ? 1 : 2) : 0, width, height);
     }
     ++m_presentCount;
     DumpOutput(tick);
@@ -1798,6 +1816,13 @@ void GSGpuBackend::PumpHostThread(std::chrono::steady_clock::time_point deadline
             break;
     }
     m_renderer->EndHostWork();
+    static auto s_lastSummary = std::chrono::steady_clock::now();
+    static const bool s_stats = envFlag("PS2X_GS_GPU_STATS");
+    if (s_stats && std::chrono::steady_clock::now() - s_lastSummary > std::chrono::seconds(10))
+    {
+        s_lastSummary = std::chrono::steady_clock::now();
+        std::cerr << "[gs-gpu] counts:" << m_renderer->UnsupportedSummary() << std::endl;
+    }
 }
 
 bool GSGpuBackend::HasPresentation() const
@@ -1836,7 +1861,7 @@ void GSGpuBackend::Execute(Command &command)
     {
         uint32_t first, count;
         pageSpan(command.extra->tex0.cpsm, command.extra->tex0.cbp, 1u, 0u, 16u, first, count);
-        r.DownloadOverlapping(first, count);
+        r.DownloadOverlapping(first, count, "clut");
         m_cpu.LoadClut(command.extra->tex0, command.extra->texclut);
         if (m_shadow)
             m_shadow->LoadClut(command.extra->tex0, command.extra->texclut);
@@ -1850,12 +1875,12 @@ void GSGpuBackend::Execute(Command &command)
         {
             uint32_t first, count;
             pageSpan(t.bitbltbuf.spsm, t.bitbltbuf.sbp, t.bitbltbuf.sbw, t.trxpos.ssay, t.trxreg.rrh, first, count);
-            r.DownloadOverlapping(first, count);
+            r.DownloadOverlapping(first, count, "transfer-source");
         }
         uint32_t first, count;
         pageSpan(t.bitbltbuf.dpsm, t.bitbltbuf.dbp, t.bitbltbuf.dbw, t.trxpos.dsay, t.trxreg.rrh, first, count);
         if (t.direction == 0u || t.direction == 2u)
-            r.DownloadOverlapping(first, count); // partial writes keep the rest of the pages
+            r.DownloadOverlapping(first, count, "transfer-dest"); // partial writes keep the rest of the pages
         m_cpu.BeginTransfer(t);
         if (t.direction == 2u)
             r.InvalidatePages(first, count);
