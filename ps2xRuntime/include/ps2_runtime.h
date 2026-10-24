@@ -333,6 +333,11 @@ public:
         SkipCallDebug = 3,
     };
 
+    // Shape of the displayed picture (width / height), default 4:3 like the TV the PS2 drives, or
+    // PS2X_ASPECT=W:H. Games with a widescreen mode set 16:9; the window is resized to match.
+    void setDisplayAspect(float aspect);
+    float displayAspect() const { return m_displayAspect; }
+
     bool replaceFunction(uint32_t address, RecompiledFunction func);
     // TODO remove this later need to update all tests
     bool registerFunction(uint32_t address, RecompiledFunction func);
@@ -528,6 +533,7 @@ private:
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
     void *m_debugUiUserData = nullptr;
     bool m_debugUiInitialized = false;
+    float m_displayAspect = 4.0f / 3.0f;
 
 public:
     std::atomic<uint32_t> m_debugPc{0};
