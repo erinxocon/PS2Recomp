@@ -556,7 +556,7 @@ namespace ps2_stubs
         }
 
         RUNTIME_LOG("[MC] Chdir port=" << port << " '" << requestedDir
-                                       << "' -> result=" << result << " cwd='" << currentDir << "'");
+                                       << "' -> result=" << result << " cwd='" << currentDir << "'\n");
         writeMcCString(rdram, currentDirAddr, currentDir);
         setReturnS32(ctx, 0);
     }
@@ -843,7 +843,7 @@ namespace ps2_stubs
             setMcCommandResultLocked(kMcCmdGetDir, result);
         }
         RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
-                                        << "' maxent=" << maxEntries << " -> result=" << result);
+                                        << "' maxent=" << maxEntries << " -> result=" << result << "\n");
         setReturnS32(ctx, 0);
     }
 
@@ -905,9 +905,12 @@ namespace ps2_stubs
             }
         }
 
-        RUNTIME_LOG("[MC] GetInfo port=" << port << " type=" << cardType
-                                         << " free=" << freeBlocks << " format=" << format
-                                         << " result=" << result);
+        // Menus poll the card every frame; PS2X_TRACE_MC=1 shows the polling.
+        static const bool s_traceMc = std::getenv("PS2X_TRACE_MC") != nullptr;
+        if (s_traceMc)
+            RUNTIME_LOG("[MC] GetInfo port=" << port << " type=" << cardType
+                                             << " free=" << freeBlocks << " format=" << format
+                                             << " result=" << result << "\n");
         setReturnS32(ctx, 0);
     }
 
@@ -1213,7 +1216,9 @@ namespace ps2_stubs
             return;
         }
 
-        RUNTIME_LOG("[MC] Sync cmd=" << cmd << " result=" << result);
+        static const bool s_traceMc = std::getenv("PS2X_TRACE_MC") != nullptr;
+        if (s_traceMc)
+            RUNTIME_LOG("[MC] Sync cmd=" << cmd << " result=" << result << "\n");
 
         if (cmdPtr != 0u)
         {
