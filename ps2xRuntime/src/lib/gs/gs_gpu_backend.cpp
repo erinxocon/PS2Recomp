@@ -1786,6 +1786,57 @@ namespace
         double sumMeanAbs = 0.0;
         std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     } g_verify;
+
+    // PS2X_GS_GPU_PRIMLOG=N (with PS2X_GS_GPU_VERIFY and PS2X_DUMP_FRAMES): log every primitive drawn
+    // between verified frames N and N+1 to primlog.txt, with its GS state, and dump the comparison of
+    // frame N+1, so the draws under differing pixels can be found (tools/gs/primlog_suspects.py).
+    long PrimLogFrame()
+    {
+        static const long frame = []()
+        {
+            const char *v = std::getenv("PS2X_GS_GPU_PRIMLOG");
+            return v ? std::strtol(v, nullptr, 0) : -1L;
+        }();
+        return frame;
+    }
+
+    void LogPrimitive(const GSPrimitiveBatch &batch)
+    {
+        static FILE *s_log = nullptr;
+        static uint64_t s_index = 0;
+        if (!s_log)
+        {
+            const char *dir = std::getenv("PS2X_DUMP_FRAMES");
+            std::string path = std::string(dir && *dir ? dir : ".") + "/primlog.txt";
+            s_log = std::fopen(path.c_str(), "w");
+            if (!s_log)
+                return;
+            std::fprintf(s_log, "# idx type ctxt nv x0 y0 x1 y1 x2 y2 tme fst tbp tbw tpsm tw th tcc tfx cbp cpsm abe alpha fge "
+                                "fog0 fog1 fog2 rgba0 rgba2 test fbp fbw fpsm fbmsk zbp zpsm zmsk clamp tex1 linear colclamp "
+                                "dthe fba texa iip q0 q2\n");
+        }
+        const GSDrawState &st = batch.state;
+        const GSContext &c = st.context;
+        const float ofx = static_cast<float>(c.xyoffset.ofx) / 16.0f, ofy = static_cast<float>(c.xyoffset.ofy) / 16.0f;
+        const GSVertex *v = batch.vertices.data();
+        const auto rgba = [](const GSVertex &x)
+        { return (uint32_t(x.r) << 24) | (uint32_t(x.g) << 16) | (uint32_t(x.b) << 8) | uint32_t(x.a); };
+        const unsigned last = batch.vertexCount ? batch.vertexCount - 1u : 0u;
+        std::fprintf(s_log,
+                     "%llu %d %d %u %.2f %.2f %.2f %.2f %.2f %.2f %d %d 0x%x %u %u %u %u %u %u 0x%x %u %d 0x%llx %d %u %u %u "
+                     "%08x %08x 0x%llx 0x%x %u %u 0x%08x 0x%x %u %d 0x%llx 0x%llx %d %llu %llu %llu %u/%u/%d %d %g %g\n",
+                     static_cast<unsigned long long>(s_index++), static_cast<int>(st.prim.type), st.prim.ctxt ? 1 : 0,
+                     batch.vertexCount, v[0].x - ofx, v[0].y - ofy, v[1].x - ofx, v[1].y - ofy, v[2].x - ofx, v[2].y - ofy,
+                     st.prim.tme ? 1 : 0, st.prim.fst ? 1 : 0, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, c.tex0.tw, c.tex0.th,
+                     c.tex0.tcc, c.tex0.tfx, c.tex0.cbp, c.tex0.cpsm, st.prim.abe ? 1 : 0,
+                     static_cast<unsigned long long>(c.alpha), st.prim.fge ? 1 : 0, v[0].fog, v[1].fog, v[2].fog, rgba(v[0]),
+                     rgba(v[last]), static_cast<unsigned long long>(c.test), c.frame.fbp, c.frame.fbw, c.frame.psm,
+                     c.frame.fbmsk, c.zbuf.zbp, c.zbuf.psm, c.zbuf.zmask ? 1 : 0, static_cast<unsigned long long>(c.clamp),
+                     static_cast<unsigned long long>(c.tex1), st.linearFilter ? 1 : 0,
+                     static_cast<unsigned long long>(st.colclamp), static_cast<unsigned long long>(st.dthe),
+                     static_cast<unsigned long long>(c.fba), st.texa.ta0, st.texa.ta1, st.texa.aem ? 1 : 0,
+                     st.prim.iip ? 1 : 0, v[0].q, v[last].q);
+    }
 }
 
 bool GSGpuBackend::Requested()
@@ -2039,6 +2090,8 @@ void GSGpuBackend::Execute(Command &command)
     switch (command.type)
     {
     case CommandType::Submit:
+        if (m_shadow && PrimLogFrame() >= 0 && g_verify.frames == static_cast<uint64_t>(PrimLogFrame()))
+            LogPrimitive(command.batch);
         r.Draw(command.batch);
         if (m_shadow)
             m_shadow->Submit(command.batch);
@@ -2146,8 +2199,9 @@ void GSGpuBackend::Execute(Command &command)
                     const char *v = std::getenv("PS2X_GS_GPU_VERIFY_TICK");
                     return v ? std::strtol(v, nullptr, 0) : -1L;
                 }();
-                const bool dumpThis = s_dumpTick >= 0 && command.extra->presentRequest.vsyncTick >= static_cast<uint64_t>(s_dumpTick) &&
-                                      command.extra->presentRequest.vsyncTick < static_cast<uint64_t>(s_dumpTick) + 4u;
+                const bool dumpThis = (s_dumpTick >= 0 && command.extra->presentRequest.vsyncTick >= static_cast<uint64_t>(s_dumpTick) &&
+                                       command.extra->presentRequest.vsyncTick < static_cast<uint64_t>(s_dumpTick) + 4u) ||
+                                      (PrimLogFrame() >= 0 && g_verify.frames == static_cast<uint64_t>(PrimLogFrame()) + 1u);
                 const bool badFrame = bad > n / 400u;
                 static uint32_t s_badDumps = 0;
                 const bool dumpBad = badFrame && s_badDumps < 12u;
