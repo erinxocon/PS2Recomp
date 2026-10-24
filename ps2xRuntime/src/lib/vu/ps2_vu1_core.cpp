@@ -4,6 +4,7 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
 #include "ps2_vu1_census.h"
+#include "ps2_vu1_lifted.h"
 
 #include <algorithm>
 #include <cfenv>
@@ -1104,7 +1105,9 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
-    if (m_activeMemory)
+    if (m_gifCaptureFn)
+        m_gifCaptureFn(m_gifCaptureCtx, m_xgkick.packet.data(), m_xgkick.totalBytes);
+    else if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
@@ -1846,6 +1849,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][3] = 1.0f;
     if (m_unit == Unit::VU1 && vu1census::enabled())
         vu1census::onExecute(vuCode, codeSize, memory ? memory->getVU1CodeGeneration() : 0u, m_state.pc);
+    else if (m_unit == Unit::VU1 && VU1Lifted::tryExecute(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles))
+        return;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 

@@ -63,6 +63,8 @@ public:
     const VU1State &state() const { return m_state; }
 
 private:
+    // Recompiled microprograms and their lockstep verifier (src/lib/vu/ps2_vu1_lifted.cpp).
+    friend struct VU1Lifted;
     enum Pipeline : uint8_t
     {
         PipelineNone = 0,
@@ -252,6 +254,9 @@ private:
     bool m_stopRequested = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
+    // When set, finished XGKICK packets go here instead of to the GIF (lockstep verification).
+    void (*m_gifCaptureFn)(void *ctx, const uint8_t *data, uint32_t size) = nullptr;
+    void *m_gifCaptureCtx = nullptr;
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
