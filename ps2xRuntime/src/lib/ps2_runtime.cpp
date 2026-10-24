@@ -20,6 +20,8 @@
 #include <fstream>
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -891,6 +893,12 @@ bool PS2Runtime::initialize(const char *title)
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        if (const char *aspect = std::getenv("PS2X_ASPECT"))
+        {
+            float w = 0.0f, h = 0.0f;
+            if (std::sscanf(aspect, "%f:%f", &w, &h) == 2 && w > 0.0f && h > 0.0f)
+                setDisplayAspect(w / h);
+        }
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -1243,6 +1251,18 @@ namespace
         const uint32_t offset = address - g_ps2RecompiledFunctionTableBase;
         slot = offset >> 2;
         return slot < g_ps2RecompiledFunctionTableSlotCount;
+    }
+}
+
+void PS2Runtime::setDisplayAspect(float aspect)
+{
+    if (!(aspect > 0.1f && aspect < 10.0f))
+        return;
+    m_displayAspect = aspect;
+    if (IsWindowReady())
+    {
+        const int height = GetScreenHeight();
+        SetWindowSize(static_cast<int>(static_cast<float>(height) * aspect + 0.5f), height);
     }
 }
 
@@ -2662,9 +2682,10 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        // The PS2 drives a 4:3 TV whatever the framebuffer resolution is, so
-        // letterbox/pillarbox the picture to 4:3 inside the window.
-        constexpr float kDisplayAspect = 4.0f / 3.0f;
+        // The PS2 drives a 4:3 TV whatever the framebuffer resolution is (16:9
+        // for games with a widescreen mode), so letterbox/pillarbox the picture
+        // to that shape inside the window.
+        const float kDisplayAspect = m_displayAspect;
         float dstWidth = screenWidth;
         float dstHeight = screenWidth / kDisplayAspect;
         if (dstHeight > screenHeight)
