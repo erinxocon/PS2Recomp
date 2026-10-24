@@ -25,15 +25,17 @@
 //   0x2108 unlit         colour = RGBA * (vf9.w, vf9.w, vf9.w, vf10.w)
 //   0x2280 unlit         same, rotated normal normalized and stored for a later pass
 // Per vertex out: STQ * Q, RGBA as integers, screen XYZF (FTOI4) with Q = 1 / clip w.
-// Batches that need clipping, or an extra pass (data[202]), continue in the lifted program: this
-// code then changes nothing and reports kLiftNotLifted, and the lifted program starts over.
+// Batches that need clipping (0x2418) or an extra pass (data[202], 0x2430) continue in the lifted
+// program at that branch target, with the state the microprogram has there (kLiftContinue).
 //
 //   PS2X_VU1_NATIVE=0         off (lifted program only)
 //   PS2X_VU1_NATIVE_BREAK=1   negative test for PS2X_VU1_VERIFY: corrupt one colour bit per batch
 
 namespace
 {
-    constexpr uint32_t kMaxVertices = 23; // keeps the +96 colour copies clear of the batch
+    // Up to 24 vertices the +96 colour copies land after the batch, where only the program's loads
+    // past its end see them (done here after the stores, as in the program).
+    constexpr uint32_t kMaxVertices = 24;
 
     struct Settings
     {
@@ -51,14 +53,15 @@ namespace
 
     struct Stats
     {
-        uint64_t drawn = 0, culled = 0, clipped = 0, extraPass = 0, other = 0;
+        uint64_t drawn = 0, culled = 0, clipped = 0, extraPass = 0, other = 0, size = 0, layout = 0, chain = 0;
         void print() const
         {
-                std::fprintf(stderr, "[vu1-native] 1B68 batches: %llu drawn, %llu culled natively; to the lifted program: "
-                                     "%llu clipped, %llu extra pass, %llu other\n",
+                std::fprintf(stderr, "[vu1-native] 1B68 batches: %llu drawn, %llu culled; continued in the lifted program: "
+                                     "%llu to clip, %llu to an extra pass; left to it: %llu (size %llu, layout %llu, chained %llu)\n",
                              static_cast<unsigned long long>(drawn), static_cast<unsigned long long>(culled),
                              static_cast<unsigned long long>(clipped), static_cast<unsigned long long>(extraPass),
-                             static_cast<unsigned long long>(other));
+                             static_cast<unsigned long long>(other), static_cast<unsigned long long>(size),
+                             static_cast<unsigned long long>(layout), static_cast<unsigned long long>(chain));
         }
         ~Stats()
         {
@@ -242,9 +245,12 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
     const uint32_t n = vu.m_state.itop & 0x3FFu;
     const int16_t outBase = lo16(26, 0);
     const uint32_t base = static_cast<uint16_t>(outBase);
+    if (s_settings.verbose && n > kMaxVertices && g_stats.size < 8u)
+        std::fprintf(stderr, "[vu1-native] batch of %u vertices at %03x, output %03x\n", n, top, base);
     if (n == 0u || n > kMaxVertices)
     {
         ++g_stats.other;
+        ++g_stats.size;
         return kLiftNotLifted;
     }
     // Everything read or written must be disjoint, so computing first and storing afterwards is
@@ -253,6 +259,7 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
     if (overlaps(top, inLen, base, outLen, qmask) || overlaps(top + 96u, 4u * n, base, outLen, qmask))
     {
         ++g_stats.other;
+        ++g_stats.layout;
         return kLiftNotLifted;
     }
     for (uint32_t c : {25u, 26u, 28u, 29u, 42u, 202u})
@@ -260,6 +267,7 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
             overlaps(c, 1u, base, outLen, qmask))
         {
             ++g_stats.other;
+            ++g_stats.layout;
             return kLiftNotLifted;
         }
 
@@ -405,25 +413,24 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
 
     const int16_t extraPass = lo16(202, 0);
     const int16_t next = lo16(29, 0);
-    const bool culled = clipAnd != 0u;
-    if (!culled)
+    // Where the microprogram goes after the batch: culled (end), an extra pass (0x2430), clipping
+    // (0x2418), or the continuation in data[29] (only the plain kick at 0x27C0 is done here).
+    enum class Exit { Culled, ExtraPass, Clip, Kick } exit = Exit::Kick;
+    if (clipAnd != 0u)
+        exit = Exit::Culled;
+    else if (extraPass != 0)
+        exit = Exit::ExtraPass;
+    else if (clipOr != 0u)
+        exit = Exit::Clip;
+    else if (static_cast<uint16_t>(next) * 8u != 0x27C0u)
     {
-        if (extraPass != 0)
-        {
-            ++g_stats.extraPass;
-            return kLiftNotLifted;
-        }
-        if (clipOr != 0u)
-        {
-            ++g_stats.clipped;
-            return kLiftNotLifted;
-        }
-        if (static_cast<uint16_t>(next) * 8u != 0x27C0u)
-        {
-            ++g_stats.other;
-            return kLiftNotLifted;
-        }
+        ++g_stats.other;
+        ++g_stats.chain;
+        if (s_settings.verbose && g_stats.chain < 8u)
+            std::fprintf(stderr, "[vu1-native] continuation %04x\n", static_cast<uint16_t>(next) * 8u);
+        return kLiftNotLifted;
     }
+    const bool culled = exit == Exit::Culled;
 
     // ---- commit: VU1 data memory -------------------------------------------------------------------
     if (s_settings.verbose && ((g_stats.drawn + g_stats.culled) & 0xFFFFFu) == 0u)
@@ -521,7 +528,8 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
         for (int c = 0; c < 3; ++c)
             vf[26][c] = last.stq[c];
         vf[27][3] = last.slot1[3];
-        if (!culled)
+        // data[42] is loaded in the delay slot of the clip branch, after the extra-pass branch.
+        if (exit == Exit::Clip || exit == Exit::Kick)
             copy4(vf[31], tag);
     }
     copy4(vu.m_state.acc, lastAcc);
@@ -548,6 +556,17 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
         vi[13] = static_cast<int16_t>(clipAnd);
         vu.m_state.pc = 0x0020u;
         return kLiftEnd;
+    }
+    if (exit != Exit::Kick)
+    {
+        // The lit modes add n to the tag count in the clip branch's delay slot; the unlit ones
+        // only after it.
+        const bool countAdded = exit == Exit::Clip && lit;
+        vi[2] = countAdded ? static_cast<int16_t>(tagX + static_cast<int32_t>(n)) : tagX;
+        vi[13] = static_cast<int16_t>(outBase + 2);
+        vu.m_state.pc = exit == Exit::Clip ? 0x2418u : 0x2430u;
+        ++(exit == Exit::Clip ? g_stats.clipped : g_stats.extraPass);
+        return kLiftContinue;
     }
 
     // GIF tag (NLOOP += n), kick, swap the output buffers.

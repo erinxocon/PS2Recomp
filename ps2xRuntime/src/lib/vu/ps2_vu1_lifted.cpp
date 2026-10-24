@@ -400,7 +400,7 @@ int VU1Lifted::runLifted(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize,
     const int previousRounding = std::fegetround();
     std::fesetround(FE_TOWARDZERO);
     int result = vu.m_state.pc == 0x1B68u ? runNative(vu, run) : kLiftNotLifted;
-    if (result == kLiftNotLifted)
+    if (result == kLiftNotLifted || result == kLiftContinue)
         result = runProgram(vu, run, vu.m_state.pc);
     std::fesetround(previousRounding);
 
