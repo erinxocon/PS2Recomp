@@ -1881,6 +1881,15 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // PS2X_TRACE_STALLS=1: report vblanks the game thread reached late (it was busy or blocked).
+                static const bool s_traceStalls = std::getenv("PS2X_TRACE_STALLS") != nullptr;
+                if (s_traceStalls)
+                {
+                    const double late = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                                  scheduled.hostDeadline).count();
+                    if (late > 20.0)
+                        std::cerr << "[stall] vblank " << m_vsyncTick << " processed " << late << " ms late" << std::endl;
+                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});

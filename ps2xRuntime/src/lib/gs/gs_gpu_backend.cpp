@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 
@@ -1608,6 +1610,37 @@ void GSGpuRenderer::RenderOutput(int mode, uint32_t w, uint32_t lines)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
+namespace
+{
+    // PNG encoding takes ~50 ms, long enough to stall the game thread behind a full GS queue (and so
+    // the IOP and audio); encode on a short-lived thread unless several are already running.
+    void ExportImageInBackground(std::vector<uint8_t> &&pixels, int width, int height, std::string path)
+    {
+        static std::atomic<int> s_inFlight{0};
+        auto job = [pixels = std::move(pixels), width, height, path = std::move(path)]() mutable
+        {
+            Image image{};
+            image.data = pixels.data();
+            image.width = width;
+            image.height = height;
+            image.mipmaps = 1;
+            image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            ExportImage(image, path.c_str());
+        };
+        if (s_inFlight.fetch_add(1) >= 4)
+        {
+            job();
+            s_inFlight.fetch_sub(1);
+            return;
+        }
+        std::thread([job = std::move(job)]() mutable
+                    {
+                        job();
+                        s_inFlight.fetch_sub(1); })
+            .detach();
+    }
+}
+
 void GSGpuRenderer::DumpOutput(uint64_t tick)
 {
     static const char *dumpDir = std::getenv("PS2X_DUMP_FRAMES");
@@ -1627,15 +1660,9 @@ void GSGpuRenderer::DumpOutput(uint64_t tick)
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glReadPixels(0, 0, m_outW, m_outH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    Image image{};
-    image.data = pixels.data();
-    image.width = static_cast<int>(m_outW);
-    image.height = static_cast<int>(m_outH);
-    image.mipmaps = 1;
-    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
     char path[1024];
     std::snprintf(path, sizeof(path), "%s/frame_%06llu.png", dumpDir, static_cast<unsigned long long>(tick));
-    ExportImage(image, path);
+    ExportImageInBackground(std::move(pixels), static_cast<int>(m_outW), static_cast<int>(m_outH), path);
 }
 
 bool GSGpuRenderer::PresentFromGpu(const GSPresentationRequest &request)
@@ -1856,7 +1883,12 @@ void GSGpuBackend::Enqueue(Command &&command)
         if (m_ready.size() > kMaxReadyBatches && m_hostStarted.load(std::memory_order_acquire) && !OnHostThread())
         {
             g_host.backpressureWaits.fetch_add(1, std::memory_order_relaxed);
+            const auto waitStart = std::chrono::steady_clock::now();
             m_doneCv.wait(lock, [&]() { return m_ready.size() <= kMaxReadyBatches / 2u || m_stopped; });
+            static const bool s_traceStalls = envFlag("PS2X_TRACE_STALLS");
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+            if (s_traceStalls && ms > 10.0)
+                std::cerr << "[stall] game thread waited " << ms << " ms on a full GS queue" << std::endl;
         }
     }
 }
@@ -1894,6 +1926,8 @@ void GSGpuBackend::RunOnHost(const std::function<void()> &fn) const
         fn();
         return;
     }
+    static const bool s_traceStalls = envFlag("PS2X_TRACE_STALLS");
+    const auto waitStart = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(m_mutex);
     if (m_stopped)
         return;
@@ -1905,6 +1939,12 @@ void GSGpuBackend::RunOnHost(const std::function<void()> &fn) const
     const uint64_t target = ++self->m_queued;
     self->PublishLocked();
     m_doneCv.wait(lock, [&]() { return m_completed >= target || m_stopped; });
+    if (s_traceStalls)
+    {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+        if (ms > 10.0)
+            std::cerr << "[stall] game thread waited " << ms << " ms for a host call" << std::endl;
+    }
 }
 
 void GSGpuBackend::ExecuteBatch(std::vector<Command> &commands)

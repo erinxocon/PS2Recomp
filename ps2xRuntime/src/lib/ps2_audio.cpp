@@ -2,6 +2,8 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
 #include "ps2x/iop/iop_audio.h"
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -94,6 +96,14 @@ namespace
                 return;
 
             std::lock_guard<std::mutex> lock(m_mutex);
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const double gap = std::chrono::duration<double, std::milli>(now - m_lastPush).count();
+                m_lastPush = now;
+                m_statMaxGap = std::max(m_statMaxGap, gap);
+                if (gap > 30.0)
+                    ++m_statLongGaps;
+            }
             for (size_t i = 0; i < frameCount * 2u; ++i)
             {
                 m_ring[m_write] = frames[i];
@@ -101,11 +111,6 @@ namespace
                 if (m_write == m_read)
                     m_read = (m_read + 2u) % m_ring.size(); // overrun: drop oldest frame
             }
-            // Keep latency bounded if emulation runs ahead of the host clock.
-            const size_t maxFill = kSampleRate / 4u * 2u;
-            const size_t fill = (m_write + m_ring.size() - m_read) % m_ring.size();
-            if (fill > maxFill)
-                m_read = (m_write + m_ring.size() - kSampleRate / 10u * 2u) % m_ring.size();
         }
 
         void shutdown()
@@ -116,6 +121,16 @@ namespace
 
     private:
         static constexpr size_t kSampleRate = ps2x::iop::kSpu2SampleRate;
+        static constexpr double kMaxExcessMs = 30.0;
+        static constexpr double kMaxRateAdjust = 0.005;
+
+        // PS2X_AUDIO_LATENCY_MS: audio buffered ahead of the device (default 40; raise it if it crackles).
+        static double targetLatencyMs()
+        {
+            const char *env = std::getenv("PS2X_AUDIO_LATENCY_MS");
+            const double ms = env ? std::strtod(env, nullptr) : 40.0;
+            return std::clamp(ms, 10.0, 250.0);
+        }
 
         Spu2HostOutput()
             : m_ring(kSampleRate * 2u)
@@ -134,32 +149,93 @@ namespace
             instance().pull(static_cast<int16_t *>(buffer), frames);
         }
 
+        // Everything buffered here is heard that much later than the game produced it, and the game
+        // judges button presses against its own clock, so the buffer is kept short: the device pulls at
+        // a rate nudged by up to +-0.5% (inaudible) to hold the smoothed fill at the target, instead of
+        // letting it drift up and snapping it back.
         void pull(int16_t *out, unsigned int frames)
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             const size_t want = static_cast<size_t>(frames) * 2u;
             size_t fill = (m_write + m_ring.size() - m_read) % m_ring.size();
+            const double fillMs = static_cast<double>(fill / 2u) * 1000.0 / kSampleRate;
             if (m_priming)
             {
-                // After an underrun wait for ~40 ms of audio before resuming.
-                if (fill < kSampleRate / 25u * 2u)
+                // At start and after an underrun, wait for the target amount before playing.
+                if (fillMs < m_targetMs)
                 {
                     std::memset(out, 0, want * sizeof(int16_t));
                     return;
                 }
                 m_priming = false;
+                m_fillEma = fillMs;
             }
-            size_t i = 0;
-            for (; i < want && fill != 0u; ++i, --fill)
+            m_fillEma += (fillMs - m_fillEma) * 0.05;
+            if (m_fillEma > m_targetMs + kMaxExcessMs)
             {
-                out[i] = m_ring[m_read];
-                m_read = (m_read + 1u) % m_ring.size();
+                // Far behind (the emulation ran ahead, e.g. after a stall): drop to the target at once.
+                const size_t keep = static_cast<size_t>(m_targetMs * kSampleRate / 1000.0) * 2u;
+                m_read = (m_write + m_ring.size() - keep) % m_ring.size();
+                fill = keep;
+                m_fillEma = m_targetMs;
+                ++m_statSnaps;
+            }
+            const double error = (m_fillEma - m_targetMs) / m_targetMs;
+            const double rate = 1.0 + std::clamp(error * 0.01, -kMaxRateAdjust, kMaxRateAdjust);
+
+            size_t i = 0;
+            for (; i < want; i += 2u)
+            {
+                if (fill < 4u)
+                    break;
+                const size_t next = (m_read + 2u) % m_ring.size();
+                const double frac = m_phase;
+                out[i] = static_cast<int16_t>(m_ring[m_read] + (m_ring[next] - m_ring[m_read]) * frac);
+                out[i + 1] = static_cast<int16_t>(m_ring[m_read + 1] + (m_ring[next + 1] - m_ring[m_read + 1]) * frac);
+                m_phase += rate;
+                while (m_phase >= 1.0 && fill >= 4u)
+                {
+                    m_phase -= 1.0;
+                    m_read = (m_read + 2u) % m_ring.size();
+                    fill -= 2u;
+                }
             }
             if (i < want)
             {
                 std::memset(out + i, 0, (want - i) * sizeof(int16_t));
                 m_priming = true;
+                m_phase = 0.0;
+                ++m_statUnderruns;
             }
+            traceFill(fill, frames);
+        }
+
+        // PS2X_TRACE_AUDIO_LATENCY=1: once a second, the buffered audio (ms) seen by the device callback.
+        void traceFill(size_t fill, unsigned int frames)
+        {
+            static const bool s_trace = std::getenv("PS2X_TRACE_AUDIO_LATENCY") != nullptr;
+            if (!s_trace)
+                return;
+            const double ms = static_cast<double>(fill / 2u) * 1000.0 / kSampleRate;
+            m_statMin = std::min(m_statMin, ms);
+            m_statMax = std::max(m_statMax, ms);
+            m_statSum += ms;
+            ++m_statCalls;
+            m_statFrames += frames;
+            if (m_statFrames < kSampleRate)
+                return;
+            std::printf("[audio] buffered ms min=%.1f avg=%.1f max=%.1f callback=%u frames underruns=%u snaps=%u"
+                        " producer max gap %.1f ms, gaps>30ms %u\n",
+                        m_statMin, m_statSum / m_statCalls, m_statMax, frames, m_statUnderruns, m_statSnaps,
+                        m_statMaxGap, m_statLongGaps);
+            std::fflush(stdout);
+            m_statMaxGap = 0.0;
+            m_statLongGaps = 0;
+            m_statMin = 1e9;
+            m_statMax = 0.0;
+            m_statSum = 0.0;
+            m_statCalls = 0;
+            m_statFrames = 0;
         }
 
         void ensureStream()
@@ -244,6 +320,19 @@ namespace
         size_t m_read = 0;
         size_t m_write = 0;
         bool m_priming = true;
+        double m_targetMs = targetLatencyMs();
+        double m_fillEma = 0.0;
+        double m_phase = 0.0;
+        double m_statMin = 1e9;
+        double m_statMax = 0.0;
+        double m_statSum = 0.0;
+        uint32_t m_statCalls = 0;
+        size_t m_statFrames = 0;
+        uint32_t m_statUnderruns = 0;
+        uint32_t m_statSnaps = 0;
+        std::chrono::steady_clock::time_point m_lastPush{};
+        double m_statMaxGap = 0.0;
+        uint32_t m_statLongGaps = 0;
         bool m_streamTried = false;
         bool m_streamReady = false;
 #if !defined(PLATFORM_VITA)
