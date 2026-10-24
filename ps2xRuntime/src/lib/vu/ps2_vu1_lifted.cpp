@@ -6,14 +6,15 @@
 
 #include <algorithm>
 #include <cfenv>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
 
-#define VF(r) vu.m_state.vf[r]
-#define VI(r) vu.m_state.vi[r]
+#define VF(r) lvf[r]
+#define VI(r) lvi[r]
 
 // ---- helpers for the generated code ---------------------------------------------------------------
 
@@ -59,13 +60,13 @@ inline void VU1Lifted::waitP(VU1Interpreter &vu)
     advance(vu, target);
 }
 
-inline int16_t VU1Lifted::bv(const VU1Interpreter &vu, const BranchBackup &bk, uint8_t reg)
+inline int16_t VU1Lifted::bv(const int32_t *vi, const VU1Interpreter &vu, const BranchBackup &bk, uint8_t reg)
 {
     if (reg == 0u)
         return 0;
     if (bk.reg == reg && bk.cycle + 1u == vu.m_cycle)
         return static_cast<int16_t>(bk.value);
-    return static_cast<int16_t>(vu.m_state.vi[reg]);
+    return static_cast<int16_t>(vi[reg]);
 }
 
 // AC5's vu_do_xgkick: the whole packet leaves at the XGKICK. The census found no store into a kicked
@@ -138,13 +139,45 @@ inline float VU1Lifted::ftoi(float value, float scale)
 
 // applyFmacDest / applyFmacDestAcc: normalize each written lane (exactly, through the interpreter,
 // only when the result is outside the plainly normal range), queue the flags if observable, write.
+// The common case (every lane plainly normal, flags not observed) stays inline.
 template <uint8_t Dest, bool Flags>
-inline void VU1Lifted::fmacStore(VU1Interpreter &vu, uint32_t word, float *result, float *dst)
+inline void VU1Lifted::fmacStore(VU1Interpreter &vu, uint32_t word, float *result, float *dst, const float (*lvf)[4],
+                                 const float *lacc)
+{
+    if constexpr (!Flags)
+    {
+        bool plain = true;
+        for (uint32_t c = 0; c < 4u; ++c)
+            if (Dest & (8u >> c))
+                plain &= ((lowBits(result[c]) >> 23) & 0xFFu) - 2u <= 251u;
+        if (plain)
+        {
+            for (uint32_t c = 0; c < 4u; ++c)
+                if (Dest & (8u >> c))
+                    dst[c] = result[c];
+            return;
+        }
+    }
+    fmacStoreSlow(vu, word, result, dst, lvf, lacc, Dest, Flags);
+}
+
+void VU1Lifted::fmacStoreSlow(VU1Interpreter &vu, uint32_t word, float *result, float *dst, const float (*lvf)[4],
+                              const float *lacc, uint8_t dest, bool flags)
 {
     uint8_t laneFlags[4] = {0u, 0u, 0u, 0u};
+    bool synced = false;
+    auto sync = [&]()
+    {
+        if (!synced)
+        {
+            std::memcpy(vu.m_state.vf, lvf, sizeof(vu.m_state.vf));
+            std::memcpy(vu.m_state.acc, lacc, sizeof(vu.m_state.acc));
+            synced = true;
+        }
+    };
     for (uint32_t c = 0; c < 4u; ++c)
     {
-        if ((Dest & (8u >> c)) == 0u)
+        if ((dest & (8u >> c)) == 0u)
             continue;
         const uint32_t bits = lowBits(result[c]);
         const uint32_t exponent = (bits >> 23) & 0xFFu;
@@ -153,25 +186,111 @@ inline void VU1Lifted::fmacStore(VU1Interpreter &vu, uint32_t word, float *resul
             laneFlags[c] = (bits >> 31) != 0u ? 0x2u : 0u;
             continue;
         }
+        sync();
         vu.m_currentUpperInstruction = word;
         double exact = 0.0;
         if (vu.calculateFmacExactResult(c, exact))
             laneFlags[c] = vu.normalizeFmacExactResult(result[c], exact);
         else
         {
-            uint32_t flags = 0u;
-            result[c] = vu.normalizeResult(result[c], flags);
-            laneFlags[c] = static_cast<uint8_t>(flags);
+            uint32_t laneFlagBits = 0u;
+            result[c] = vu.normalizeResult(result[c], laneFlagBits);
+            laneFlags[c] = static_cast<uint8_t>(laneFlagBits);
         }
     }
-    if (Flags && vu.m_flagsObservable)
+    if (flags && vu.m_flagsObservable)
     {
+        sync();
         vu.m_currentUpperInstruction = word;
-        vu.updateFmacFlags(laneFlags, Dest, vu.calculateFmacProductSticky(Dest));
+        vu.updateFmacFlags(laneFlags, dest, vu.calculateFmacProductSticky(dest));
     }
     for (uint32_t c = 0; c < 4u; ++c)
-        if ((Dest & (8u >> c)) != 0u)
+        if ((dest & (8u >> c)) != 0u)
             dst[c] = result[c];
+}
+
+inline void VU1Lifted::opDiv(VU1Interpreter &vu, float numRaw, float denRaw)
+{
+    const float num = vu.normalizeOperand(numRaw);
+    const float den = vu.normalizeOperand(denRaw);
+    uint32_t statusDi = 0u;
+    float result = 0.0f;
+    if (den == 0.0f)
+    {
+        statusDi = num == 0.0f ? 0x10u : 0x20u;
+        result = std::signbit(num) != std::signbit(den) ? -std::numeric_limits<float>::max()
+                                                        : std::numeric_limits<float>::max();
+    }
+    else
+        result = num / den;
+    uint32_t ignoredFlags = 0u;
+    result = vu.normalizeResult(result, ignoredFlags);
+    vu.queueQ(result, 7u, statusDi);
+}
+
+inline void VU1Lifted::opSqrt(VU1Interpreter &vu, float valueRaw)
+{
+    const float val = vu.normalizeOperand(valueRaw);
+    vu.queueQ(std::sqrt(std::fabs(val)), 7u, val < 0.0f ? 0x10u : 0u);
+}
+
+inline void VU1Lifted::opRsqrt(VU1Interpreter &vu, float numRaw, float radicandRaw)
+{
+    const float num = vu.normalizeOperand(numRaw);
+    const float radicand = vu.normalizeOperand(radicandRaw);
+    const float den = std::sqrt(std::fabs(radicand));
+    uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
+    float result = 0.0f;
+    if (den != 0.0f)
+        result = num / den;
+    else
+    {
+        statusDi = num == 0.0f ? 0x10u : 0x20u;
+        result = std::signbit(num) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+    }
+    uint32_t ignoredFlags = 0u;
+    result = vu.normalizeResult(result, ignoredFlags);
+    vu.queueQ(result, 13u, statusDi);
+}
+
+inline void VU1Lifted::opErleng(VU1Interpreter &vu, const float *v)
+{
+    const float x = vu.normalizeOperand(v[0]);
+    const float y = vu.normalizeOperand(v[1]);
+    const float z = vu.normalizeOperand(v[2]);
+    const float len = std::sqrt(x * x + y * y + z * z);
+    vu.queueP(len != 0.0f ? 1.0f / len : len, 24u);
+}
+
+inline void VU1Lifted::opEsqrt(VU1Interpreter &vu, float valueRaw)
+{
+    const float value = vu.normalizeOperand(valueRaw);
+    vu.queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
+}
+
+inline void VU1Lifted::opClip(VU1Interpreter &vu, const float *fs, float ftw)
+{
+    uint32_t wBits = lowBits(ftw);
+    const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+    auto exceeds = [limit](float value, uint32_t signMask)
+    {
+        const int32_t ordered = static_cast<int32_t>(lowBits(value) ^ signMask);
+        return ordered > limit;
+    };
+    uint32_t flags = 0u;
+    if (exceeds(fs[0], 0x00000000u))
+        flags |= 0x01u;
+    if (exceeds(fs[0], 0x80000000u))
+        flags |= 0x02u;
+    if (exceeds(fs[1], 0x00000000u))
+        flags |= 0x04u;
+    if (exceeds(fs[1], 0x80000000u))
+        flags |= 0x08u;
+    if (exceeds(fs[2], 0x00000000u))
+        flags |= 0x10u;
+    if (exceeds(fs[2], 0x80000000u))
+        flags |= 0x20u;
+    vu.queueClip(flags);
 }
 
 // ---- the generated program ------------------------------------------------------------------------

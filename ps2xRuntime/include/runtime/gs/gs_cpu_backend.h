@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -33,6 +34,21 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    // Helpers for backends that keep GS memory as the source of truth (GSGpuBackend).
+    // Raw values of a w x h rectangle in `psm` (ReadVram layout: 24/16-bit and indexed formats
+    // are returned unexpanded), row-major.
+    void ReadRect(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                  uint32_t *out) const;
+    void WriteRect(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                   const uint32_t *in);
+    // Texels as SampleTexture's point sampling returns them (RGBA8, TEXA applied, CLUT resolved for
+    // indexed formats), without wrapping: texel (x0 + i, y0 + j).
+    void DecodeTexels(const GSDrawState &state, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t *out);
+    // The RGBA8 colour an index of TEX0's indexed format resolves to through the current CLUT.
+    uint32_t PaletteEntry(const GSDrawState &state, uint8_t index);
+    // Changes whenever the CLUT buffer is reloaded.
+    uint64_t ClutVersion() const { return m_clutVersion.load(std::memory_order_relaxed); }
+
 private:
     void ResetUnlocked();
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
@@ -47,6 +63,7 @@ private:
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+    uint32_t FetchTexelUnlocked(const GSDrawState &state, int u, int v);
 
     void PerformLocalToLocalTransfer();
     void PerformLocalToHostTransfer();
@@ -72,6 +89,7 @@ private:
     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
+    std::atomic<uint64_t> m_clutVersion{0};
     GSMem::TexturePageCache m_texturePageCache;
 
     GSTransferCommand m_transfer{};

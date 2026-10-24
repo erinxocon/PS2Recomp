@@ -540,6 +540,11 @@ namespace GSMem
 
 	void InitLookupTables();
 
+	// The page lookup table a format addresses through (pixel offsets within a page, indexed
+	// [base block % 32][y % page height][x % page width], row-major), for GPU-side swizzling.
+	// Returns nullptr for formats without one.
+	const u16* PageTableData(u32 psm, u32& pageWidth, u32& pageHeight);
+
     // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
 

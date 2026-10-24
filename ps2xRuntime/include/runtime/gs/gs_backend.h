@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_types.h"
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 class GSRasterBackend
@@ -23,6 +24,13 @@ public:
     virtual void TextureFlush() = 0;
     virtual void Sync(GSSyncReason reason) = 0;
     virtual PresentationFrame Present(const GSPresentationRequest &request) = 0;
+
+    using PresentCallback = std::function<void(PresentationFrame &&)>;
+    // Backends that build frames on another thread can present behind the queued commands without
+    // blocking the caller: the callback receives the frame (on that thread). PresentAsync returns
+    // false, queueing nothing, while an earlier one is still pending.
+    virtual bool SupportsAsyncPresent() const { return false; }
+    virtual bool PresentAsync(const GSPresentationRequest &, PresentCallback) { return false; }
 
     virtual bool ClearFramebuffer(const GSContext &context, uint32_t rgba) = 0;
     virtual uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) = 0;

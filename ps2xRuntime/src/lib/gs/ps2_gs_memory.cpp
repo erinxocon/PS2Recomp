@@ -201,6 +201,42 @@ namespace GSMem
     static P8PageLookupTable   PageTableP8{ };
     static P4PageLookupTable   PageTableP4{ };
 
+    const u16* PageTableData(u32 psm, u32& pageWidth, u32& pageHeight)
+    {
+        auto data = [&](const auto& table, u32 w, u32 h) -> const u16*
+        {
+            pageWidth = w;
+            pageHeight = h;
+            return &table[0][0][0];
+        };
+        switch (static_cast<PixelStorageMode>(psm))
+        {
+        case C32:
+        case C24:
+        case P8H:
+        case P4HL:
+        case P4HH:
+            return data(PageTableC32, 64, 32);
+        case Z32:
+        case Z24:
+            return data(PageTableZ32, 64, 32);
+        case C16:
+            return data(PageTableC16, 64, 64);
+        case C16S:
+            return data(PageTableC16S, 64, 64);
+        case Z16:
+            return data(PageTableZ16, 64, 64);
+        case Z16S:
+            return data(PageTableZ16S, 64, 64);
+        case P8:
+            return data(PageTableP8, 128, 64);
+        case P4:
+            return data(PageTableP4, 128, 128);
+        default:
+            return nullptr;
+        }
+    }
+
     void InitLookupTables()
     {
         // 32 bit
