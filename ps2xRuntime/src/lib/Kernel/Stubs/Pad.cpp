@@ -2,6 +2,8 @@
 #include "Pad.h"
 #include "runtime/ee_scheduler.h"
 
+#include <fstream>
+
 namespace ps2_stubs
 {
     namespace
@@ -195,6 +197,9 @@ namespace ps2_stubs
 
         // PS2X_INPUT_SCRIPT="start@600:10,cross@900" presses a button at a guest vsync tick for N frames
         // (default 6). lleft/lright/lup/ldown push the left stick fully. Used for unattended testing; port 0 only.
+        // PS2X_INPUT_LIVE=<file> also reads lines appended to <file> while the game runs, in the same
+        // syntax with ticks counted from when the line is read ("cross", "down@20:4,cross@40"); a dev tool
+        // for driving menus from another process.
         struct ScriptedPress
         {
             uint16_t mask = 0;
@@ -204,59 +209,97 @@ namespace ps2_stubs
             uint64_t frames = 6;
         };
 
+        void parsePresses(const std::string &text, uint64_t base, std::vector<ScriptedPress> &result)
+        {
+            static const std::pair<const char *, uint16_t> kNames[] = {
+                {"select", kPadBtnSelect}, {"l3", kPadBtnL3}, {"r3", kPadBtnR3}, {"start", kPadBtnStart},
+                {"up", kPadBtnUp}, {"right", kPadBtnRight}, {"down", kPadBtnDown}, {"left", kPadBtnLeft},
+                {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
+                {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross},
+                {"square", kPadBtnSquare}};
+            size_t start = 0;
+            while (start < text.size())
+            {
+                size_t end = text.find(',', start);
+                if (end == std::string::npos)
+                    end = text.size();
+                std::string item = text.substr(start, end - start);
+                start = end + 1;
+                item.erase(0, item.find_first_not_of(" \t\r\n"));
+                item.erase(item.find_last_not_of(" \t\r\n") + 1);
+                const size_t at = item.find('@');
+                const size_t colon = item.find(':');
+                const size_t nameEnd = std::min(at, colon);
+                ScriptedPress press;
+                const std::string name = item.substr(0, nameEnd);
+                for (const auto &[label, mask] : kNames)
+                {
+                    if (name == label)
+                        press.mask = mask;
+                }
+                if (name == "lleft")
+                    press.stickX = -1;
+                else if (name == "lright")
+                    press.stickX = 1;
+                else if (name == "lup")
+                    press.stickY = -1;
+                else if (name == "ldown")
+                    press.stickY = 1;
+                press.tick = base + (at != std::string::npos ? std::strtoull(item.c_str() + at + 1, nullptr, 10) : 0);
+                if (colon != std::string::npos)
+                    press.frames = std::strtoull(item.c_str() + colon + 1, nullptr, 10);
+                if (press.mask != 0 || press.stickX != 0 || press.stickY != 0)
+                    result.push_back(press);
+            }
+        }
+
         const std::vector<ScriptedPress> &scriptedPresses()
         {
             static const std::vector<ScriptedPress> presses = []()
             {
                 std::vector<ScriptedPress> result;
-                const char *script = std::getenv("PS2X_INPUT_SCRIPT");
-                if (!script)
-                {
-                    return result;
-                }
-                static const std::pair<const char *, uint16_t> kNames[] = {
-                    {"select", kPadBtnSelect}, {"l3", kPadBtnL3}, {"r3", kPadBtnR3}, {"start", kPadBtnStart},
-                    {"up", kPadBtnUp}, {"right", kPadBtnRight}, {"down", kPadBtnDown}, {"left", kPadBtnLeft},
-                    {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
-                    {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross},
-                    {"square", kPadBtnSquare}};
-                std::string text(script);
-                size_t start = 0;
-                while (start < text.size())
-                {
-                    size_t end = text.find(',', start);
-                    if (end == std::string::npos)
-                        end = text.size();
-                    const std::string item = text.substr(start, end - start);
-                    start = end + 1;
-                    const size_t at = item.find('@');
-                    if (at == std::string::npos)
-                        continue;
-                    ScriptedPress press;
-                    const std::string name = item.substr(0, at);
-                    for (const auto &[label, mask] : kNames)
-                    {
-                        if (name == label)
-                            press.mask = mask;
-                    }
-                    if (name == "lleft")
-                        press.stickX = -1;
-                    else if (name == "lright")
-                        press.stickX = 1;
-                    else if (name == "lup")
-                        press.stickY = -1;
-                    else if (name == "ldown")
-                        press.stickY = 1;
-                    press.tick = std::strtoull(item.c_str() + at + 1, nullptr, 10);
-                    const size_t colon = item.find(':', at);
-                    if (colon != std::string::npos)
-                        press.frames = std::strtoull(item.c_str() + colon + 1, nullptr, 10);
-                    if (press.mask != 0 || press.stickX != 0 || press.stickY != 0)
-                        result.push_back(press);
-                }
+                if (const char *script = std::getenv("PS2X_INPUT_SCRIPT"))
+                    parsePresses(script, 0, result);
                 return result;
             }();
             return presses;
+        }
+
+        // Presses read from PS2X_INPUT_LIVE so far, with absolute ticks; expired ones are dropped.
+        std::vector<ScriptedPress> &livePresses(uint64_t tick)
+        {
+            static std::vector<ScriptedPress> presses;
+            static const char *s_path = std::getenv("PS2X_INPUT_LIVE");
+            static std::streamoff s_offset = 0;
+            static uint64_t s_lastCheck = ~0ull;
+            if (!s_path || !*s_path || tick == s_lastCheck)
+                return presses;
+            s_lastCheck = tick;
+            std::ifstream file(s_path);
+            if (!file)
+                return presses;
+            file.seekg(s_offset);
+            std::string line;
+            while (std::getline(file, line))
+            {
+                if (file.eof())
+                    break;  // partial line: read it once it is complete
+                s_offset = file.tellg();
+                std::cout << "[pad] live input @" << tick << ": " << line << std::endl;
+                parsePresses(line, tick + 1, presses);
+            }
+            std::erase_if(presses, [tick](const ScriptedPress &p) { return tick >= p.tick + p.frames; });
+            return presses;
+        }
+
+        void applyPress(PadInputState &state, const ScriptedPress &press, uint64_t tick)
+        {
+            const bool active = tick >= press.tick && tick < press.tick + press.frames;
+            setButton(state, press.mask, active);
+            if (active && press.stickX != 0)
+                state.lx = press.stickX < 0 ? 0x00 : 0xFF;
+            if (active && press.stickY != 0)
+                state.ly = press.stickY < 0 ? 0x00 : 0xFF;
         }
 
         void applyScriptedState(PadInputState &state, PS2Runtime *runtime, int port)
@@ -267,14 +310,9 @@ namespace ps2_stubs
             }
             const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
             for (const ScriptedPress &press : scriptedPresses())
-            {
-                const bool active = tick >= press.tick && tick < press.tick + press.frames;
-                setButton(state, press.mask, active);
-                if (active && press.stickX != 0)
-                    state.lx = press.stickX < 0 ? 0x00 : 0xFF;
-                if (active && press.stickY != 0)
-                    state.ly = press.stickY < 0 ? 0x00 : 0xFF;
-            }
+                applyPress(state, press, tick);
+            for (const ScriptedPress &press : livePresses(tick))
+                applyPress(state, press, tick);
         }
 
         void resetPadStateLocked()
