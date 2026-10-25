@@ -1364,6 +1364,27 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
         m_vertices.push_back(makeVertex(v0, v2, zconst, depthOf(v0)));
         m_vertices.push_back(makeVertex(v1, v2, zconst, depthOf(v1)));
         m_vertices.push_back(makeVertex(v2, v2, zconst, depthOf(v2)));
+        // Vertices behind the camera reach the GS with S, T and Q clamped to +-FLT_MAX (the VU has
+        // no infinity). The CPU rasterizer interpolates those fine, but GL's attribute setup
+        // overflows and the triangle samples garbage. S/Q and T/Q do not change when all three
+        // are scaled together, so bring huge ones down by a power of two (exact).
+        static const bool s_rawStq = std::getenv("PS2X_GS_GPU_STQ_RAW") != nullptr;
+        if (!st.prim.fst && !s_rawStq)
+        {
+            float big = 0.0f;
+            for (const GSVertex *v : {&v0, &v1, &v2})
+                big = std::max({big, std::fabs(v->s), std::fabs(v->t), std::fabs(v->q)});
+            if (big > 0x1p64f)
+            {
+                const float scale = std::ldexp(1.0f, 64 - std::ilogb(big));
+                for (size_t i = m_vertices.size() - 3u; i < m_vertices.size(); ++i)
+                {
+                    m_vertices[i].s *= scale;
+                    m_vertices[i].t *= scale;
+                    m_vertices[i].q *= scale;
+                }
+            }
+        }
         break;
     }
     default:
@@ -1841,31 +1862,52 @@ namespace
     // PS2X_GS_GPU_PRIMLOG=N (with PS2X_GS_GPU_VERIFY and PS2X_DUMP_FRAMES): log every primitive drawn
     // between verified frames N and N+1 to primlog.txt, with its GS state, and dump the comparison of
     // frame N+1, so the draws under differing pixels can be found (tools/gs/primlog_suspects.py).
+    // PS2X_GS_GPU_PRIMLOG=bad logs every frame and keeps the first bad one instead (frame numbers
+    // differ from run to run, so a bad frame seen once is hard to hit by number).
+    constexpr long kPrimLogFirstBad = -2;
     long PrimLogFrame()
     {
         static const long frame = []()
         {
             const char *v = std::getenv("PS2X_GS_GPU_PRIMLOG");
-            return v ? std::strtol(v, nullptr, 0) : -1L;
+            if (!v)
+                return -1L;
+            return std::strcmp(v, "bad") == 0 ? kPrimLogFirstBad : std::strtol(v, nullptr, 0);
         }();
         return frame;
     }
 
+    std::string g_primLog;
+    bool g_primLogDone = false;
+
+    bool PrimLogging(uint64_t verifiedFrames)
+    {
+        const long n = PrimLogFrame();
+        return !g_primLogDone && (n == kPrimLogFirstBad || (n >= 0 && verifiedFrames == static_cast<uint64_t>(n)));
+    }
+
+    void WritePrimLog()
+    {
+        const char *dir = std::getenv("PS2X_DUMP_FRAMES");
+        const std::string path = std::string(dir && *dir ? dir : ".") + "/primlog.txt";
+        if (FILE *f = std::fopen(path.c_str(), "w"))
+        {
+            std::fputs("# idx type ctxt nv x0 y0 x1 y1 x2 y2 tme fst tbp tbw tpsm tw th tcc tfx cbp cpsm abe alpha fge "
+                       "fog0 fog1 fog2 rgba0 rgba2 test fbp fbw fpsm fbmsk zbp zpsm zmsk clamp tex1 linear colclamp "
+                       "dthe fba texa iip q0 q2 s0 t0 s1 t1 q1 s2 t2\n",
+                       f);
+            std::fwrite(g_primLog.data(), 1, g_primLog.size(), f);
+            std::fclose(f);
+        }
+        g_primLogDone = true;
+    }
+
     void LogPrimitive(const GSPrimitiveBatch &batch)
     {
-        static FILE *s_log = nullptr;
         static uint64_t s_index = 0;
-        if (!s_log)
-        {
-            const char *dir = std::getenv("PS2X_DUMP_FRAMES");
-            std::string path = std::string(dir && *dir ? dir : ".") + "/primlog.txt";
-            s_log = std::fopen(path.c_str(), "w");
-            if (!s_log)
-                return;
-            std::fprintf(s_log, "# idx type ctxt nv x0 y0 x1 y1 x2 y2 tme fst tbp tbw tpsm tw th tcc tfx cbp cpsm abe alpha fge "
-                                "fog0 fog1 fog2 rgba0 rgba2 test fbp fbw fpsm fbmsk zbp zpsm zmsk clamp tex1 linear colclamp "
-                                "dthe fba texa iip q0 q2\n");
-        }
+        if (g_primLog.empty())
+            s_index = 0;
+        char line[1024];
         const GSDrawState &st = batch.state;
         const GSContext &c = st.context;
         const float ofx = static_cast<float>(c.xyoffset.ofx) / 16.0f, ofy = static_cast<float>(c.xyoffset.ofy) / 16.0f;
@@ -1873,9 +1915,10 @@ namespace
         const auto rgba = [](const GSVertex &x)
         { return (uint32_t(x.r) << 24) | (uint32_t(x.g) << 16) | (uint32_t(x.b) << 8) | uint32_t(x.a); };
         const unsigned last = batch.vertexCount ? batch.vertexCount - 1u : 0u;
-        std::fprintf(s_log,
+        const int len = std::snprintf(line, sizeof(line),
                      "%llu %d %d %u %.2f %.2f %.2f %.2f %.2f %.2f %d %d 0x%x %u %u %u %u %u %u 0x%x %u %d 0x%llx %d %u %u %u "
-                     "%08x %08x 0x%llx 0x%x %u %u 0x%08x 0x%x %u %d 0x%llx 0x%llx %d %llu %llu %llu %u/%u/%d %d %g %g\n",
+                     "%08x %08x 0x%llx 0x%x %u %u 0x%08x 0x%x %u %d 0x%llx 0x%llx %d %llu %llu %llu %u/%u/%d %d %g %g "
+                     "%g %g %g %g %g %g %g\n",
                      static_cast<unsigned long long>(s_index++), static_cast<int>(st.prim.type), st.prim.ctxt ? 1 : 0,
                      batch.vertexCount, v[0].x - ofx, v[0].y - ofy, v[1].x - ofx, v[1].y - ofy, v[2].x - ofx, v[2].y - ofy,
                      st.prim.tme ? 1 : 0, st.prim.fst ? 1 : 0, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, c.tex0.tw, c.tex0.th,
@@ -1886,7 +1929,9 @@ namespace
                      static_cast<unsigned long long>(c.tex1), st.linearFilter ? 1 : 0,
                      static_cast<unsigned long long>(st.colclamp), static_cast<unsigned long long>(st.dthe),
                      static_cast<unsigned long long>(c.fba), st.texa.ta0, st.texa.ta1, st.texa.aem ? 1 : 0,
-                     st.prim.iip ? 1 : 0, v[0].q, v[last].q);
+                     st.prim.iip ? 1 : 0, v[0].q, v[last].q, v[0].s, v[0].t, v[1].s, v[1].t, v[1].q, v[2].s, v[2].t);
+        if (len > 0)
+            g_primLog.append(line, std::min<size_t>(static_cast<size_t>(len), sizeof(line) - 1u));
     }
 }
 
@@ -2141,7 +2186,7 @@ void GSGpuBackend::Execute(Command &command)
     switch (command.type)
     {
     case CommandType::Submit:
-        if (m_shadow && PrimLogFrame() >= 0 && g_verify.frames == static_cast<uint64_t>(PrimLogFrame()))
+        if (m_shadow && PrimLogging(g_verify.frames))
             LogPrimitive(command.batch);
         r.Draw(command.batch);
         if (m_shadow)
@@ -2250,10 +2295,16 @@ void GSGpuBackend::Execute(Command &command)
                     const char *v = std::getenv("PS2X_GS_GPU_VERIFY_TICK");
                     return v ? std::strtol(v, nullptr, 0) : -1L;
                 }();
+                const bool badFrame = bad > n / 400u;
+                // The log holds the draws of the frame just compared (logged while frames was one less).
+                const bool primLogThis = PrimLogging(g_verify.frames - 1u) &&
+                                         (PrimLogFrame() >= 0 || badFrame);
+                if (primLogThis)
+                    WritePrimLog();
+                g_primLog.clear();
                 const bool dumpThis = (s_dumpTick >= 0 && command.extra->presentRequest.vsyncTick >= static_cast<uint64_t>(s_dumpTick) &&
                                        command.extra->presentRequest.vsyncTick < static_cast<uint64_t>(s_dumpTick) + 4u) ||
-                                      (PrimLogFrame() >= 0 && g_verify.frames == static_cast<uint64_t>(PrimLogFrame()) + 1u);
-                const bool badFrame = bad > n / 400u;
+                                      primLogThis;
                 static uint32_t s_badDumps = 0;
                 const bool dumpBad = badFrame && s_badDumps < 12u;
                 if (dumpBad)
