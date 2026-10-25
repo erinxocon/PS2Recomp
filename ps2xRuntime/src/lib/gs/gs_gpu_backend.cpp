@@ -1364,6 +1364,27 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
         m_vertices.push_back(makeVertex(v0, v2, zconst, depthOf(v0)));
         m_vertices.push_back(makeVertex(v1, v2, zconst, depthOf(v1)));
         m_vertices.push_back(makeVertex(v2, v2, zconst, depthOf(v2)));
+        // Vertices behind the camera reach the GS with S, T and Q clamped to +-FLT_MAX (the VU has
+        // no infinity). The CPU rasterizer interpolates those fine, but GL's attribute setup
+        // overflows and the triangle samples garbage. S/Q and T/Q do not change when all three
+        // are scaled together, so bring huge ones down by a power of two (exact).
+        static const bool s_rawStq = std::getenv("PS2X_GS_GPU_STQ_RAW") != nullptr;
+        if (!st.prim.fst && !s_rawStq)
+        {
+            float big = 0.0f;
+            for (const GSVertex *v : {&v0, &v1, &v2})
+                big = std::max({big, std::fabs(v->s), std::fabs(v->t), std::fabs(v->q)});
+            if (big > 0x1p64f)
+            {
+                const float scale = std::ldexp(1.0f, 64 - std::ilogb(big));
+                for (size_t i = m_vertices.size() - 3u; i < m_vertices.size(); ++i)
+                {
+                    m_vertices[i].s *= scale;
+                    m_vertices[i].t *= scale;
+                    m_vertices[i].q *= scale;
+                }
+            }
+        }
         break;
     }
     default:
