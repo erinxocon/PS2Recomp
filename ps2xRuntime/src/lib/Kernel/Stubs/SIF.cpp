@@ -25,8 +25,8 @@ namespace ps2_stubs
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t srcAddr = getRegU32(ctx, 7); // $a3
-        const uint32_t dstAddr = readStackU32(rdram, ctx, 16);
-        const uint32_t size = readStackU32(rdram, ctx, 20);
+        const uint32_t dstAddr = getRegU32(ctx, 8); // $t0: arguments 5+ are passed in t0-t3 on the EE
+        const uint32_t size = getRegU32(ctx, 9);    // $t1
         if (size != 0u && srcAddr != 0u && dstAddr != 0u)
         {
             std::vector<uint8_t> payload(size);
