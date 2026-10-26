@@ -1608,7 +1608,6 @@ namespace
     static_assert(sizeof(GsClearMem) == 96, "GsClearMem size mismatch");
     static_assert(sizeof(GsDBuffDcMem) == 0x330, "GsDBuffDcMem size mismatch");
 
-    constexpr uint32_t kGsParamScratchOffset = 0x100;
     GsGParam g_gparam{1, 2, 1, 3}; // Default: interlaced NTSC, frame mode.
 
     static uint64_t makePmode(uint32_t en1, uint32_t en2, uint32_t mmod, uint32_t amod, uint32_t slbg, uint32_t alp)
@@ -1957,14 +1956,20 @@ namespace
         env.test2 = {makeTest(ztest), GS_REG_TEST_2};
     }
 
+    // libgraph's sceGsGParam is four shorts (interlace, omode, ffmode, version) in the library's
+    // own data. It is kept in a guest block of its own: the scratchpad belongs to the game.
     static uint32_t writeGsGParamToScratch(PS2Runtime *runtime)
     {
         if (!runtime)
             return 0;
-        uint8_t *scratch = runtime->memory().getScratchpad();
-        if (!scratch)
+        static uint32_t s_guestAddr = 0u;
+        if (s_guestAddr == 0u)
+            s_guestAddr = runtime->guestMalloc(16u, 16u);
+        uint8_t *dst = s_guestAddr ? runtime->memory().getRDRAM() + (s_guestAddr & PS2_RAM_MASK) : nullptr;
+        if (!dst)
             return 0;
-        std::memcpy(scratch + kGsParamScratchOffset, &g_gparam, sizeof(g_gparam));
-        return PS2_SCRATCHPAD_BASE + kGsParamScratchOffset;
+        const uint16_t fields[4] = {g_gparam.interlace, g_gparam.omode, g_gparam.ffmode, g_gparam.version};
+        std::memcpy(dst, fields, sizeof(fields));
+        return s_guestAddr;
     }
 }

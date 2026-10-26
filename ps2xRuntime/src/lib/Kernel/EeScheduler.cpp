@@ -1435,9 +1435,12 @@ void EeScheduler::completeVSync(uint64_t tick)
         GuestThread *waiter = thread(id);
         assert(waiter != nullptr);
         const EeVSyncWait wait = std::get<EeVSyncWait>(waiter->wait.payload);
+        // sceGsSyncV returns CSR.FIELD read after the vsync, which VBlankStart has just set to
+        // tick & 1. PS2X_SYNCV_OLD_FIELD=1 restores the previous (opposite) parity.
+        static const bool s_oldField = std::getenv("PS2X_SYNCV_OLD_FIELD") != nullptr;
         const int result = wait.fixedResult >= 0
                                ? wait.fixedResult
-                               : static_cast<int>((tick - 1u) & 1u);
+                               : static_cast<int>((s_oldField ? tick - 1u : tick) & 1u);
         makeReady(*waiter, result, false);
     }
     publishSnapshot();
