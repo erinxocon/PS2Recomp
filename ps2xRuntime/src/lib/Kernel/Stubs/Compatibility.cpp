@@ -4,11 +4,23 @@
 
 namespace ps2_stubs
 {
+    namespace
+    {
+        void checkAlloc(const char *what, uint32_t size, uint32_t result, R5900Context *ctx)
+        {
+            static const bool s_check = std::getenv("PS2X_TRACE_STUB_CHECKS") != nullptr;
+            static uint32_t s_reports = 0;
+            if (s_check && (size == 0u || result == 0u) && s_reports++ < 20u)
+                std::fprintf(stderr, "[stub-check] %s size=%u -> 0x%x ra=0x%x\n", what, size, result, getRegU32(ctx, 31));
+        }
+    }
+
     void calloc_r(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t count = getRegU32(ctx, 5); // $a1
         const uint32_t size = getRegU32(ctx, 6);  // $a2
         const uint32_t guestAddr = runtime ? runtime->guestCalloc(count, size) : 0u;
+        checkAlloc("calloc_r", count * size, guestAddr, ctx);
         setReturnU32(ctx, guestAddr);
     }
 
@@ -44,6 +56,7 @@ namespace ps2_stubs
         const uint32_t oldGuestAddr = getRegU32(ctx, 5); // $a1
         const uint32_t newSize = getRegU32(ctx, 6);      // $a2
         const uint32_t guestAddr = runtime ? runtime->guestRealloc(oldGuestAddr, newSize) : 0u;
+        checkAlloc("realloc_r", newSize, guestAddr, ctx);
         setReturnU32(ctx, guestAddr);
     }
 
@@ -52,6 +65,7 @@ namespace ps2_stubs
         const uint32_t alignment = getRegU32(ctx, 5); // $a1
         const uint32_t size = getRegU32(ctx, 6);      // $a2
         const uint32_t guestAddr = runtime ? runtime->guestMalloc(size, alignment) : 0u;
+        checkAlloc("memalign_r", size, guestAddr, ctx);
         setReturnU32(ctx, guestAddr);
     }
 
@@ -59,6 +73,7 @@ namespace ps2_stubs
     {
         const uint32_t size = getRegU32(ctx, 5); // $a1
         const uint32_t guestAddr = runtime ? runtime->guestMalloc(size) : 0u;
+        checkAlloc("malloc_r", size, guestAddr, ctx);
         setReturnU32(ctx, guestAddr);
     }
 

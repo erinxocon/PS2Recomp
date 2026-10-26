@@ -71,40 +71,17 @@ namespace ps2_stubs
             uint32_t arg2 = 0u;
         };
 
+        // Arguments 5-7 are in t0-t2 on the EE; there is no stack home area to fall back to.
         GsTrailingArgs2 decodeGsTrailingArgs2(uint8_t *rdram, R5900Context *ctx)
         {
-            const uint32_t reg8 = getRegU32(ctx, 8);
-            const uint32_t reg9 = getRegU32(ctx, 9);
-            const uint32_t stack0 = readStackU32(rdram, ctx, 16);
-            const uint32_t stack1 = readStackU32(rdram, ctx, 20);
-
-            const bool hasRegArgs = (reg8 != 0u || reg9 != 0u);
-            const bool hasStackArgs = (stack0 != 0u || stack1 != 0u);
-            if (hasRegArgs || !hasStackArgs)
-            {
-                return {reg8, reg9};
-            }
-
-            return {stack0, stack1};
+            (void)rdram;
+            return {getRegU32(ctx, 8), getRegU32(ctx, 9)};
         }
 
         GsTrailingArgs3 decodeGsTrailingArgs3(uint8_t *rdram, R5900Context *ctx)
         {
-            const uint32_t reg8 = getRegU32(ctx, 8);
-            const uint32_t reg9 = getRegU32(ctx, 9);
-            const uint32_t reg10 = getRegU32(ctx, 10);
-            const uint32_t stack0 = readStackU32(rdram, ctx, 16);
-            const uint32_t stack1 = readStackU32(rdram, ctx, 20);
-            const uint32_t stack2 = readStackU32(rdram, ctx, 24);
-
-            const bool hasRegArgs = (reg8 != 0u || reg9 != 0u || reg10 != 0u);
-            const bool hasStackArgs = (stack0 != 0u || stack1 != 0u || stack2 != 0u);
-            if (hasRegArgs || !hasStackArgs)
-            {
-                return {reg8, reg9, reg10};
-            }
-
-            return {stack0, stack1, stack2};
+            (void)rdram;
+            return {getRegU32(ctx, 8), getRegU32(ctx, 9), getRegU32(ctx, 10)};
         }
 
         void applyGsClearPacket(PS2Runtime *runtime, const GsClearMem &clear)
@@ -772,14 +749,26 @@ namespace ps2_stubs
 
     void sceGsPutDrawEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t envAddr = getRegU32(ctx, 4);
-        GsRegPairMem pairs[8]{};
-        if (!readGsRegPairs(rdram, envAddr, pairs, 8u))
+        // The argument is a GIF tag (A+D, NLOOP register pairs follow), which the original
+        // sends by DMA; the pairs start one qword after it.
+        const uint32_t tagAddr = getRegU32(ctx, 4);
+        const uint8_t *tag = getConstMemPtr(rdram, tagAddr);
+        if (!tag)
         {
             setReturnS32(ctx, -1);
             return;
         }
-        applyGsRegPairs(runtime, pairs, 8u);
+        uint64_t tagLo = 0;
+        std::memcpy(&tagLo, tag, sizeof(tagLo));
+        constexpr uint32_t kMaxPairs = 16u;
+        const uint32_t count = std::min<uint32_t>(static_cast<uint32_t>(tagLo & 0x7FFFu), kMaxPairs);
+        GsRegPairMem pairs[kMaxPairs]{};
+        if (!readGsRegPairs(rdram, tagAddr + 16u, pairs, count))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        applyGsRegPairs(runtime, pairs, count);
         setReturnS32(ctx, 0);
     }
 

@@ -93,6 +93,14 @@ namespace ps2_stubs
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
         size = sanitizeMemTransferSize(size, "memcpy");
+        {
+            static const bool s_check = std::getenv("PS2X_TRACE_STUB_CHECKS") != nullptr;
+            static uint32_t s_reports = 0;
+            if (s_check && size != 0u && destAddr != srcAddr && destAddr < srcAddr + size && srcAddr < destAddr + size &&
+                s_reports++ < 20u)
+                std::fprintf(stderr, "[stub-check] memcpy overlap dst=0x%x src=0x%x size=%u ra=0x%x\n", destAddr, srcAddr,
+                             size, getRegU32(ctx, 31));
+        }
 
         uint32_t copied = 0u;
         uint32_t curDst = destAddr;
@@ -114,7 +122,18 @@ namespace ps2_stubs
                 break;
             }
 
-            ::memcpy(hostDest, hostSrc, chunk);
+            // The game's memcpy copies forward, and the game does overlap (e.g. 0x10a168 shifts a
+            // buffer down by 4): memmove gives the same bytes for dst < src; a forward byte copy
+            // reproduces the original's pattern replication for dst > src.
+            if (hostDest > hostSrc && hostDest < hostSrc + chunk)
+            {
+                for (uint32_t i = 0; i < chunk; ++i)
+                    hostDest[i] = hostSrc[i];
+            }
+            else
+            {
+                ::memmove(hostDest, hostSrc, chunk);
+            }
             copied += chunk;
             curDst += chunk;
             curSrc += chunk;

@@ -5,7 +5,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <limits>
 #include <stdexcept>
 
@@ -410,8 +414,13 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return false;
     }
 
+    // PS2X_NO_TIMESLICE=1: like the EE kernel, never preempt for a thread of the same priority
+    // (only a higher one); equal-priority threads then switch only when one blocks or rotates.
+    static const bool s_noTimeSlice = std::getenv("PS2X_NO_TIMESLICE") != nullptr;
     const GuestThread *running = currentThread();
-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
+    if (running != nullptr &&
+        (s_noTimeSlice ? (running->currentPriority > 0 && hasReadyAtOrAbovePriority(running->currentPriority - 1))
+                       : hasReadyAtOrAbovePriority(running->currentPriority)))
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
@@ -569,6 +578,9 @@ int EeScheduler::terminateThread(int id, uint32_t &ownedStack, bool interruptSaf
     ownedStack = 0;
     if (id == 0 || id == m_currentThreadId)
     {
+        static const bool s_check = std::getenv("PS2X_TRACE_STUB_CHECKS") != nullptr;
+        if (s_check && id != 0 && interruptSafe)
+            std::fprintf(stderr, "[stub-check] iWakeupThread(%d) on the interrupted thread was dropped\n", id);
         return KE_ILLEGAL_THID;
     }
     GuestThread *target = thread(id);
@@ -690,6 +702,9 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
     assertExecutor();
     if (id == 0 || id == m_currentThreadId)
     {
+        static const bool s_check = std::getenv("PS2X_TRACE_STUB_CHECKS") != nullptr;
+        if (s_check && id != 0 && interruptSafe)
+            std::fprintf(stderr, "[stub-check] iWakeupThread(%d) on the interrupted thread was dropped\n", id);
         return KE_ILLEGAL_THID;
     }
     GuestThread *target = thread(id);
@@ -1307,6 +1322,45 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
+    // PS2X_IRQ_CHAIN_STOP=1: run the handlers one after another and stop at the first that
+    // returns 0. PS2X_TRACE_STUB_CHECKS=1 reports handlers returning 0 with others after them.
+    static const bool s_chainStop = std::getenv("PS2X_IRQ_CHAIN_STOP") != nullptr;
+    static const bool s_check = std::getenv("PS2X_TRACE_STUB_CHECKS") != nullptr;
+    if ((s_chainStop || s_check) && matching.size() > 1u)
+    {
+        auto chain = std::make_shared<std::vector<EeIrqHandler>>(std::move(matching));
+        auto queueAt = std::make_shared<std::function<void(size_t)>>();
+        *queueAt = [this, chain, cause, dmac, queueAt](size_t index)
+        {
+            const EeIrqHandler &handler = (*chain)[index];
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::Interrupt;
+            invocation.context.pc = handler.handler;
+            SET_GPR_U32(&invocation.context, 4, cause);
+            SET_GPR_U32(&invocation.context, 5, handler.argument);
+            SET_GPR_U32(&invocation.context, 28, handler.gp);
+            SET_GPR_U32(&invocation.context, 29, 0u);
+            SET_GPR_U32(&invocation.context, 31, 0u);
+            invocation.onComplete = [this, chain, cause, dmac, queueAt, index](const R5900Context &done, R5900Context &)
+            {
+                const uint32_t result = getRegU32(&done, 2);
+                const bool last = index + 1u >= chain->size();
+                if (result == 0u && !last && s_check)
+                {
+                    static uint32_t s_reports = 0;
+                    if (s_reports++ < 20u)
+                        std::fprintf(stderr, "[stub-check] %s cause %u handler 0x%x returned 0 before %zu more%s\n",
+                                     dmac ? "DMAC" : "INTC", cause, (*chain)[index].handler, chain->size() - index - 1u,
+                                     s_chainStop ? " (chain stopped)" : "");
+                }
+                if (!last && !(s_chainStop && result == 0u))
+                    (*queueAt)(index + 1u);
+            };
+            queueInvocation(std::move(invocation));
+        };
+        (*queueAt)(0u);
+        return;
+    }
     for (const EeIrqHandler &handler : matching)
     {
         GuestInvocation invocation{};
@@ -1381,9 +1435,12 @@ void EeScheduler::completeVSync(uint64_t tick)
         GuestThread *waiter = thread(id);
         assert(waiter != nullptr);
         const EeVSyncWait wait = std::get<EeVSyncWait>(waiter->wait.payload);
+        // sceGsSyncV returns CSR.FIELD read after the vsync, which VBlankStart has just set to
+        // tick & 1. PS2X_SYNCV_OLD_FIELD=1 restores the previous (opposite) parity.
+        static const bool s_oldField = std::getenv("PS2X_SYNCV_OLD_FIELD") != nullptr;
         const int result = wait.fixedResult >= 0
                                ? wait.fixedResult
-                               : static_cast<int>((tick - 1u) & 1u);
+                               : static_cast<int>((s_oldField ? tick - 1u : tick) & 1u);
         makeReady(*waiter, result, false);
     }
     publishSnapshot();
