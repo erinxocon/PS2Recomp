@@ -122,7 +122,18 @@ namespace ps2_stubs
                 break;
             }
 
-            ::memcpy(hostDest, hostSrc, chunk);
+            // The game's memcpy copies forward, and the game does overlap (e.g. 0x10a168 shifts a
+            // buffer down by 4): memmove gives the same bytes for dst < src; a forward byte copy
+            // reproduces the original's pattern replication for dst > src.
+            if (hostDest > hostSrc && hostDest < hostSrc + chunk)
+            {
+                for (uint32_t i = 0; i < chunk; ++i)
+                    hostDest[i] = hostSrc[i];
+            }
+            else
+            {
+                ::memmove(hostDest, hostSrc, chunk);
+            }
             copied += chunk;
             curDst += chunk;
             curSrc += chunk;
