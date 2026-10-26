@@ -93,6 +93,14 @@ namespace ps2_stubs
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
         size = sanitizeMemTransferSize(size, "memcpy");
+        {
+            static const bool s_check = std::getenv("PS2X_TRACE_STUB_CHECKS") != nullptr;
+            static uint32_t s_reports = 0;
+            if (s_check && size != 0u && destAddr != srcAddr && destAddr < srcAddr + size && srcAddr < destAddr + size &&
+                s_reports++ < 20u)
+                std::fprintf(stderr, "[stub-check] memcpy overlap dst=0x%x src=0x%x size=%u ra=0x%x\n", destAddr, srcAddr,
+                             size, getRegU32(ctx, 31));
+        }
 
         uint32_t copied = 0u;
         uint32_t curDst = destAddr;
