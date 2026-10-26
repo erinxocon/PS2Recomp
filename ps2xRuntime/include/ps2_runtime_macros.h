@@ -1,6 +1,7 @@
 #ifndef PS2_RUNTIME_MACROS_H
 #define PS2_RUNTIME_MACROS_H
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <bit>
@@ -273,6 +274,18 @@ inline bool ps2_fall_normal(float a, float b, float r)
 inline bool ps2_fnormal(float r)
 {
     return (std::bit_cast<uint32_t>(r) * 2u + 0x01000000u) >= 0x02000000u;
+}
+
+// CVT.W.S truncates toward zero (the EE FPU has no other rounding mode) and saturates: anything
+// at or above 2^31 in magnitude, Inf and NaN patterns included, becomes INT32_MAX / INT32_MIN by
+// sign, as in PCSX2. PS2X_FPU_CVT_NEAREST=1 restores the old round-to-nearest conversion.
+inline int32_t ps2_cvt_w_s(float f)
+{
+    static const bool s_nearest = std::getenv("PS2X_FPU_CVT_NEAREST") != nullptr;
+    const uint32_t u = std::bit_cast<uint32_t>(f);
+    if ((u & 0x7F800000u) <= 0x4E800000u)
+        return s_nearest ? static_cast<int32_t>(nearbyintf(f)) : static_cast<int32_t>(f);
+    return (u & PS2_FLOAT_SIGN_MASK) ? INT32_MIN : INT32_MAX;
 }
 
 inline float ps2_fadd(float a, float b)
@@ -853,7 +866,7 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+#define FPU_CVT_W_S(a) ps2_cvt_w_s((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

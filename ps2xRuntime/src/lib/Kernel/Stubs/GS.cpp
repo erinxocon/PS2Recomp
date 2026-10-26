@@ -943,9 +943,12 @@ namespace ps2_stubs
         uint32_t psm = getRegU32(ctx, 5);
         uint32_t w = getRegU32(ctx, 6);
         uint32_t h = getRegU32(ctx, 7);
-        const uint32_t ztest = readStackU32(rdram, ctx, 16);
-        const uint32_t zpsm = readStackU32(rdram, ctx, 20);
-        const uint32_t clear = readStackU32(rdram, ctx, 24);
+        // Arguments 5-7 arrive in t0-t2 (the EE passes eight arguments in registers); reading them
+        // from the stack picked up whatever the caller had left there, e.g. a Z test that rejected
+        // every pixel of the movie frames.
+        const uint32_t ztest = getRegU32(ctx, 8);
+        const uint32_t zpsm = getRegU32(ctx, 9);
+        const uint32_t clear = getRegU32(ctx, 10);
         (void)clear;
 
         if (w == 0u)
