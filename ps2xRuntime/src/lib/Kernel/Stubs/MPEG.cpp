@@ -804,14 +804,11 @@ namespace ps2_stubs
             return FAST_READ32(getRegU32(ctx, 29) + offset);
         }
 
+        // Argument 5 is in t0 on the EE (eight argument registers, no stack home area).
         uint32_t readAbiArg4(uint8_t *rdram, R5900Context *ctx)
         {
-            const uint32_t regArg = getRegU32(ctx, 8);
-            if (regArg != 0u)
-            {
-                return regArg;
-            }
-            return readStackArg(rdram, ctx, 0x10u);
+            (void)rdram;
+            return getRegU32(ctx, 8);
         }
 
         MpegPlaybackState &getPlaybackState(uint32_t mpegAddr)
@@ -2139,13 +2136,9 @@ namespace ps2_stubs
         mpegGuestWrite32(rdram, uVar3 + 0x94, 0xFFFFFFFFu);
         mpegGuestWrite32(rdram, uVar3 + 0x98, 0xFFFFFFFFu);
 
-        mpegGuestWrite32(rdram, 0x1717BCu, param_1);
-
-        static const uint32_t s_refValues[] = {
-            0x171A50u, 0x171C58u, 0x171CC0u, 0x171D28u, 0x171D90u,
-            0x171AB8u, 0x171B20u, 0x171B88u, 0x171BF0u};
-        for (unsigned i = 0; i < 9u; ++i)
-            mpegGuestWrite32(rdram, 0x171800u + i * 4u, s_refValues[i]);
+        // The libmpeg globals (current mp, reference picture pointers) live at game-specific
+        // addresses; the ones once written here belonged to another game and landed in
+        // Gitaroo's code. The HLE decoder keeps its own state, so they are not written at all.
 
         uint32_t setDynamicRet = a1_init;
         if (uint8_t *p = getMemPtr(rdram, puVar4 + 8))
@@ -2629,7 +2622,6 @@ namespace ps2_stubs
         mpegGuestWrite32(rdram, param_1 + 0x08, 0u);
         mpegGuestWrite32(rdram, inner + 0x80, 0xFFFFFFFFu);
         mpegGuestWrite32(rdram, inner + 0xAC, 0u);
-        mpegGuestWrite32(rdram, 0x171904u, 0u);
     }
 
     void sceMpegResetDefaultPtsGap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
