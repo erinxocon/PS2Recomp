@@ -1,6 +1,10 @@
 #include "Common.h"
 #include "Audio.h"
 #include "../../ps2_iop_transport.h"
+#include "runtime/ee_scheduler.h"
+
+#include <cstdio>
+#include <cstdlib>
 
 namespace ps2_stubs
 {
@@ -180,6 +184,12 @@ namespace ps2_stubs
             uint32_t remoteResult = 0u;
             if (sdrRemoteCall(rdram, ctx, runtime, cmd, args, remoteResult))
             {
+                // PS2X_TRACE_SDR=1: every libsdr call (command, arguments, result, caller).
+                static const bool s_traceSdr = std::getenv("PS2X_TRACE_SDR") != nullptr;
+                if (s_traceSdr)
+                    std::fprintf(stderr, "[sdr] tick=%llu ra=%08x cmd=%04x args=%08x %08x %08x %08x %08x %08x result=%08x\n",
+                                 static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), getRegU32(ctx, 31),
+                                 cmd, args[0], args[1], args[2], args[3], args[4], args[5], remoteResult);
                 setReturnU32(ctx, remoteResult);
                 return;
             }
