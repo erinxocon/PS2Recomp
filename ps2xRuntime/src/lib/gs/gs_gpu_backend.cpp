@@ -8,6 +8,8 @@
 #include "raylib.h"
 
 #include <algorithm>
+#include <cfenv>
+#include <limits>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -90,6 +92,15 @@ layout(location = 0) in vec3 aPos;        // GS window x, y; z as depth in [0, 1
 layout(location = 1) in vec4 aColor;      // 0..255
 layout(location = 2) in vec3 aStq;        // S T Q, or U V (1/16 texels) and 1
 layout(location = 3) in vec2 aFogZconst;  // fog 0..255, 1 when the primitive has constant Z
+// Native VU1 batch vertices (PS2X_VU1_GPU): the batch's inputs, transformed and lit here as the
+// microprogram's entry 1B68 does (ps2_vu1_native.cpp), constants per batch in uConsts.
+layout(location = 4) in vec4 aP;
+layout(location = 5) in vec4 aN;
+layout(location = 6) in vec4 aT;
+layout(location = 7) in vec4 aC;
+layout(location = 8) in vec4 aMesh;       // constants index, XYOFFSET x, y, constant Z
+uniform int uMesh;
+uniform samplerBuffer uConsts;             // 18 vec4 per batch, see GSGpuRenderer::AddMeshTriangle
 uniform vec2 uTargetSize;
 noperspective out vec4 vColor;
 noperspective out vec3 vStq;
@@ -97,15 +108,54 @@ noperspective out float vFog;
 noperspective out float vDepth;
 flat out float vDepthFlat;
 flat out float vDepthConst;
+vec4 K(int i) { return texelFetch(uConsts, int(aMesh.x) * 18 + i); }
+float lowByte(float v) { return float(int(v) & 255); }
+// The VU has no infinity: overflowing results become +-FLT_MAX.
+vec4 vuClamp(vec4 v) { return clamp(v, vec4(-3.4028235e38), vec4(3.4028235e38)); }
 void main()
 {
-    gl_Position = vec4(aPos.x / uTargetSize.x * 2.0 - 1.0, aPos.y / uTargetSize.y * 2.0 - 1.0, 0.0, 1.0);
-    vColor = aColor;
-    vStq = aStq;
-    vFog = aFogZconst.x;
-    vDepth = aPos.z;
-    vDepthFlat = aPos.z;
-    vDepthConst = aFogZconst.y;
+    if (uMesh == 0)
+    {
+        gl_Position = vec4(aPos.x / uTargetSize.x * 2.0 - 1.0, aPos.y / uTargetSize.y * 2.0 - 1.0, 0.0, 1.0);
+        vColor = aColor;
+        vStq = aStq;
+        vFog = aFogZconst.x;
+        vDepth = aPos.z;
+        vDepthFlat = aPos.z;
+        vDepthConst = aFogZconst.y;
+        return;
+    }
+    vec4 misc = K(17);                     // mode, STQ w, lit, normalize
+    bool lit = misc.z > 0.5;
+    vec4 clip = ((K(0) * aP.x + K(1) * aP.y) + K(2) * aP.z) + K(3) * aP.w;
+    float q = clip.w == 0.0 ? 3.4028235e38 : 1.0 / clip.w;
+    vec4 sp = vuClamp(vec4(clip.xyz * q, clip.w));
+    vec4 scr = vuClamp(sp * K(7)) + K(8);
+    vec4 colour;
+    if (lit)
+    {
+        vec3 nr = ((K(4).xyz * aN.x + K(5).xyz * aN.y) + K(6).xyz * aN.z);
+        if (misc.w > 0.5)
+            nr *= inversesqrt(dot(nr, nr));
+        vec4 L = (K(9) * nr.x + K(10) * nr.y) + K(11) * nr.z;
+        vec3 lc = ((K(12).xyz * L.x + K(13).xyz * L.y) + K(14).xyz * L.z) + K(15).xyz * L.w;
+        vec4 amount = vec4(max(lc, vec3(0.0)), K(6).w);
+        colour = min(aC * amount + K(16), vec4(K(4).w));
+    }
+    else
+        colour = vec4(aC.rgb * K(5).w, aC.a * K(6).w);
+    // What the GS takes from the packed STQ, RGBA (FTOI0) and XYZF2 (FTOI4) words.
+    vec4 xyzf = trunc(scr * 16.0);
+    float x = float(int(xyzf.x) & 0xFFFF) / 16.0 - aMesh.y;
+    float y = float(int(xyzf.y) & 0xFFFF) / 16.0 - aMesh.z;
+    float z = float((int(xyzf.z) >> 4) & 0xFFFFFF) * (1.0 / 4294967296.0);
+    gl_Position = vec4(x / uTargetSize.x * 2.0 - 1.0, y / uTargetSize.y * 2.0 - 1.0, 0.0, 1.0);
+    vColor = vec4(lowByte(colour.r), lowByte(colour.g), lowByte(colour.b), lowByte(colour.a));
+    vStq = vuClamp(vec4(aT.xyz * q, 0.0)).xyz;
+    vFog = float((int(xyzf.w) >> 4) & 255);
+    vDepth = z;
+    vDepthFlat = z;
+    vDepthConst = aMesh.w;
 }
 )";
 
@@ -388,6 +438,20 @@ void main()
         float s, t, q;
         float fog, zconst;
     };
+
+    // A native VU1 batch vertex: the batch's inputs; the vertex shader transforms and lights it.
+    struct MeshVertex
+    {
+        float p[4], n[4], t[4], c[4];
+        float slot, ofx, ofy, zconst;
+    };
+    constexpr uint32_t kMeshConstantTexels = 18u;
+
+    bool envOn(const char *name)
+    {
+        const char *v = std::getenv(name);
+        return v && *v && std::strcmp(v, "0") != 0;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -512,6 +576,18 @@ private:
     }();
     GLuint m_dstTex = 0;
     uint32_t m_dstW = 0, m_dstH = 0;
+    // PS2X_VU1_GPU: native VU1 batches (gs_types.h NativeVu1Batch) transformed in the vertex shader.
+    // PS2X_VU1_GPU_VERIFY=1 checks each such vertex, computed on the CPU with the shader's formulas,
+    // against the vertex the GS decoded from the batch's packet.
+    bool m_vu1Gpu = envOn("PS2X_VU1_GPU");
+    bool m_vu1GpuVerify = envOn("PS2X_VU1_GPU_VERIFY");
+    GLuint m_meshVao = 0, m_meshVbo = 0, m_constBuf = 0, m_constTex = 0;
+    std::vector<MeshVertex> m_meshVertices;
+    std::vector<float> m_meshConstants;
+    uint32_t m_meshLastSerial = 0;
+    uint64_t m_meshChecked = 0, m_meshMismatches = 0;
+    void AddMeshTriangle(const GSPrimitiveBatch &batch, bool zconst, int ofx, int ofy);
+    void CheckMeshVertex(const NativeVu1Batch &nb, const GSVertex &gv);
     GLuint m_program = 0, m_vao = 0, m_vbo = 0;
     std::unordered_map<std::string, GLint> m_uniforms;
     GLint U(const char *name);
@@ -681,6 +757,20 @@ void GSGpuRenderer::EnsureGl()
     glEnableVertexAttribArray(3);
     glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void *>(offsetof(Vertex, fog)));
     glBindVertexArray(0);
+
+    glGenVertexArrays(1, &m_meshVao);
+    glGenBuffers(1, &m_meshVbo);
+    glBindVertexArray(m_meshVao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_meshVbo);
+    for (GLuint i = 0; i < 5u; ++i)
+    {
+        glEnableVertexAttribArray(4u + i);
+        glVertexAttribPointer(4u + i, 4, GL_FLOAT, GL_FALSE, sizeof(MeshVertex),
+                              reinterpret_cast<void *>(static_cast<uintptr_t>(i * 16u)));
+    }
+    glBindVertexArray(0);
+    glGenBuffers(1, &m_constBuf);
+    glGenTextures(1, &m_constTex);
 
     const GLuint pvs = compileShader(GL_VERTEX_SHADER, kPresentVertexShader);
     const GLuint pfs = compileShader(GL_FRAGMENT_SHADER, kPresentFragmentShader);
@@ -1325,6 +1415,16 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
         return out;
     };
 
+    // Native VU1 batch triangles go to the mesh path (transformed in the vertex shader); the two
+    // kinds are flushed in order whenever the stream switches between them.
+    const bool meshTriangle = m_vu1Gpu && batch.native && st.prim.iip && !st.prim.fst && !m_key.alphaSplit &&
+                              batch.vertexCount == 3u && batch.vertices[0].nativeIndex < batch.native->count &&
+                              batch.vertices[1].nativeIndex < batch.native->count &&
+                              batch.vertices[2].nativeIndex < batch.native->count &&
+                              (st.prim.type == GS_PRIM_TRIANGLE || st.prim.type == GS_PRIM_TRISTRIP || st.prim.type == GS_PRIM_TRIFAN);
+    if (meshTriangle ? !m_vertices.empty() : !m_meshVertices.empty())
+        FlushDraws();
+
     switch (st.prim.type)
     {
     case GS_PRIM_SPRITE:
@@ -1390,6 +1490,11 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
     {
         const GSVertex &v0 = batch.vertices[0], &v1 = batch.vertices[1], &v2 = batch.vertices[2];
         const bool zconst = v0.z == v1.z && v1.z == v2.z;
+        if (meshTriangle)
+        {
+            AddMeshTriangle(batch, zconst, ofx, ofy);
+            break;
+        }
         auto depthOf = [](const GSVertex &v)
         { return static_cast<float>(std::floor(v.z + 0.5) * kDepthScale); };
         m_vertices.push_back(makeVertex(v0, v2, zconst, depthOf(v0)));
@@ -1628,8 +1733,192 @@ void GSGpuRenderer::FlushExact()
     FlushDraws();
 }
 
+void GSGpuRenderer::AddMeshTriangle(const GSPrimitiveBatch &batch, bool zconst, int ofx, int ofy)
+{
+    const NativeVu1Batch &nb = *batch.native;
+    if (nb.serial != m_meshLastSerial || m_meshConstants.empty())
+    {
+        m_meshLastSerial = nb.serial;
+        const bool lit = nb.mode == 0x1B80u || nb.mode == 0x1E10u;
+        const bool normalize = nb.mode == 0x1E10u || nb.mode == 0x2280u;
+        auto put = [&](const float *v) { m_meshConstants.insert(m_meshConstants.end(), v, v + 4); };
+        for (const auto &col : nb.mvp)
+            put(col);
+        for (const auto &r : nb.rot)
+            put(r);
+        put(nb.scale);
+        put(nb.offset);
+        for (const auto &l : nb.lightDir)
+            put(l);
+        for (const auto &c : nb.lightCol)
+            put(c);
+        put(nb.emissive);
+        const float misc[4] = {static_cast<float>(nb.mode), nb.stqW, lit ? 1.0f : 0.0f, normalize ? 1.0f : 0.0f};
+        put(misc);
+    }
+    const float slot = static_cast<float>(m_meshConstants.size() / 4u / kMeshConstantTexels - 1u);
+    for (int i = 0; i < 3; ++i)
+    {
+        const uint8_t k = batch.vertices[static_cast<size_t>(i)].nativeIndex;
+        MeshVertex v{};
+        std::memcpy(v.p, nb.in[k][0], 16);
+        std::memcpy(v.n, nb.in[k][1], 16);
+        std::memcpy(v.t, nb.in[k][2], 16);
+        std::memcpy(v.c, nb.in[k][3], 16);
+        v.slot = slot;
+        v.ofx = static_cast<float>(ofx);
+        v.ofy = static_cast<float>(ofy);
+        v.zconst = zconst ? 1.0f : 0.0f;
+        m_meshVertices.push_back(v);
+        if (m_vu1GpuVerify)
+            CheckMeshVertex(nb, batch.vertices[static_cast<size_t>(i)]);
+    }
+}
+
+namespace
+{
+    // Products kept from being fused with the following add (the shader and the VU do not fuse).
+    float mulNoFma(float a, float b)
+    {
+        volatile float p = a * b;
+        return p;
+    }
+    float madd4(const float *m0, const float *m1, const float *m2, const float *m3, const float *v, int c)
+    {
+        return ((mulNoFma(m0[c], v[0]) + mulNoFma(m1[c], v[1])) + mulNoFma(m2[c], v[2])) + mulNoFma(m3[c], v[3]);
+    }
+    float vuClamp(float v)
+    {
+        constexpr float kMax = std::numeric_limits<float>::max();
+        return std::isnan(v) ? v : std::clamp(v, -kMax, kMax);
+    }
+}
+
+// The shader's formulas on the CPU, against the words the native code put in the packet (what the
+// GS then decodes): the check of the mesh path's data and arithmetic.
+void GSGpuRenderer::CheckMeshVertex(const NativeVu1Batch &nb, const GSVertex &gv)
+{
+    // The VU rounds toward zero (the VU1 code runs in that host rounding mode); the shader can only
+    // round to nearest. PS2X_VU1_GPU_VERIFY=2 checks the formulas with the VU's rounding (must be
+    // exact), =1 with the shader's (ulp differences in Z and positions show up here).
+    static const bool s_vuRounding = []()
+    {
+        const char *v = std::getenv("PS2X_VU1_GPU_VERIFY");
+        return v && std::strcmp(v, "2") == 0;
+    }();
+    const int savedRounding = std::fegetround();
+    if (s_vuRounding)
+        std::fesetround(FE_TOWARDZERO);
+    struct RestoreRounding
+    {
+        int mode;
+        ~RestoreRounding() { std::fesetround(mode); }
+    } restore{savedRounding};
+    const uint8_t k = gv.nativeIndex;
+    const float *P = nb.in[k][0], *N = nb.in[k][1], *T = nb.in[k][2], *C = nb.in[k][3];
+    const bool lit = nb.mode == 0x1B80u || nb.mode == 0x1E10u;
+    const bool normalize = nb.mode == 0x1E10u || nb.mode == 0x2280u;
+    float clip[4], scr[4], colour[4];
+    for (int c = 0; c < 4; ++c)
+        clip[c] = madd4(nb.mvp[0], nb.mvp[1], nb.mvp[2], nb.mvp[3], P, c);
+    const float q = clip[3] == 0.0f ? std::numeric_limits<float>::max() : 1.0f / clip[3];
+    const float sp[4] = {vuClamp(mulNoFma(clip[0], q)), vuClamp(mulNoFma(clip[1], q)), vuClamp(mulNoFma(clip[2], q)), clip[3]};
+    for (int c = 0; c < 4; ++c)
+        scr[c] = vuClamp(mulNoFma(sp[c], nb.scale[c])) + nb.offset[c];
+    if (lit)
+    {
+        float nr[3];
+        for (int c = 0; c < 3; ++c)
+            nr[c] = (mulNoFma(nb.rot[0][c], N[0]) + mulNoFma(nb.rot[1][c], N[1])) + mulNoFma(nb.rot[2][c], N[2]);
+        if (normalize)
+        {
+            const float len = 1.0f / std::sqrt((mulNoFma(nr[0], nr[0]) + mulNoFma(nr[1], nr[1])) + mulNoFma(nr[2], nr[2]));
+            for (float &x : nr)
+                x = mulNoFma(x, len);
+        }
+        float L[4], lc[3];
+        for (int c = 0; c < 4; ++c)
+            L[c] = (mulNoFma(nb.lightDir[0][c], nr[0]) + mulNoFma(nb.lightDir[1][c], nr[1])) + mulNoFma(nb.lightDir[2][c], nr[2]);
+        for (int c = 0; c < 3; ++c)
+            lc[c] = madd4(nb.lightCol[0], nb.lightCol[1], nb.lightCol[2], nb.lightCol[3], L, c);
+        const float amount[4] = {std::max(lc[0], 0.0f), std::max(lc[1], 0.0f), std::max(lc[2], 0.0f), nb.rot[2][3]};
+        for (int c = 0; c < 4; ++c)
+            colour[c] = std::min(mulNoFma(C[c], amount[c]) + nb.emissive[c], nb.rot[0][3]);
+    }
+    else
+    {
+        for (int c = 0; c < 3; ++c)
+            colour[c] = mulNoFma(C[c], nb.rot[1][3]);
+        colour[3] = mulNoFma(C[3], nb.rot[2][3]);
+    }
+    auto ftoi = [](float v, float scale) { return static_cast<int32_t>(std::trunc(v * scale)); };
+    int32_t xyzf[4], rgba[4];
+    for (int c = 0; c < 4; ++c)
+    {
+        xyzf[c] = ftoi(scr[c], 16.0f);
+        rgba[c] = ftoi(colour[c], 1.0f);
+    }
+    const float st[3] = {vuClamp(mulNoFma(T[0], q)), vuClamp(mulNoFma(T[1], q)), vuClamp(mulNoFma(T[2], q))};
+    const uint32_t *ostq = nb.out[k][0], *orgba = nb.out[k][1], *oxyzf = nb.out[k][2];
+    // Only the bits the GS uses: X, Y 16 bits, Z 24 bits above 4, fog 8 bits above 4, colour bytes.
+    bool ok = true;
+    ok &= (static_cast<uint32_t>(xyzf[0]) & 0xFFFFu) == (oxyzf[0] & 0xFFFFu);
+    ok &= (static_cast<uint32_t>(xyzf[1]) & 0xFFFFu) == (oxyzf[1] & 0xFFFFu);
+    ok &= ((static_cast<uint32_t>(xyzf[2]) >> 4) & 0xFFFFFFu) == ((oxyzf[2] >> 4) & 0xFFFFFFu);
+    ok &= ((static_cast<uint32_t>(xyzf[3]) >> 4) & 0xFFu) == ((oxyzf[3] >> 4) & 0xFFu);
+    for (int c = 0; c < 4; ++c)
+        ok &= (static_cast<uint32_t>(rgba[c]) & 0xFFu) == (orgba[c] & 0xFFu);
+    for (int c = 0; c < 3; ++c)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &st[c], 4);
+        ok &= bits == ostq[c];
+    }
+    ++m_meshChecked;
+    if (!ok && ++m_meshMismatches <= 20u)
+    {
+        float ost[3];
+        std::memcpy(ost, ostq, 12);
+        std::fprintf(stderr, "[vu1-gpu] vertex %u (mode %04x) differs: xyzf %d %d %d %d / %d %d %d %d rgba %d %d %d %d / %u %u %u %u "
+                             "stq %g %g %g / %g %g %g\n",
+                     k, nb.mode, xyzf[0], xyzf[1], xyzf[2], xyzf[3], static_cast<int32_t>(oxyzf[0]), static_cast<int32_t>(oxyzf[1]),
+                     static_cast<int32_t>(oxyzf[2]), static_cast<int32_t>(oxyzf[3]), rgba[0], rgba[1], rgba[2], rgba[3], orgba[0],
+                     orgba[1], orgba[2], orgba[3], st[0], st[1], st[2], ost[0], ost[1], ost[2]);
+    }
+    if ((m_meshChecked & ((1u << 22) - 1u)) == 0u)
+        std::fprintf(stderr, "[vu1-gpu] %llu vertices checked, %llu differ\n", static_cast<unsigned long long>(m_meshChecked),
+                     static_cast<unsigned long long>(m_meshMismatches));
+}
+
 void GSGpuRenderer::FlushDraws()
 {
+    if (!m_meshVertices.empty())
+    {
+        glBindBuffer(GL_TEXTURE_BUFFER, m_constBuf);
+        glBufferData(GL_TEXTURE_BUFFER, static_cast<GLsizeiptr>(m_meshConstants.size() * sizeof(float)), m_meshConstants.data(),
+                     GL_STREAM_DRAW);
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_BUFFER, m_constTex);
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, m_constBuf);
+        glActiveTexture(GL_TEXTURE0);
+        glBindBuffer(GL_TEXTURE_BUFFER, 0);
+        glUniform1i(U("uConsts"), 5);
+        glUniform1i(U("uMesh"), 1);
+        glBindVertexArray(m_meshVao);
+        glBindBuffer(GL_ARRAY_BUFFER, m_meshVbo);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_meshVertices.size() * sizeof(MeshVertex)), m_meshVertices.data(),
+                     GL_STREAM_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_meshVertices.size()));
+        glBindVertexArray(0);
+        glUniform1i(U("uMesh"), 0);
+        if (m_keyColor)
+            m_keyColor->gpuNewer = true;
+        if (m_keyDepth && (m_key.depthMode == 2u || m_key.depthMode == 3u))
+            m_keyDepth->gpuNewer = true;
+        m_meshVertices.clear();
+        m_meshConstants.clear();
+        m_meshLastSerial = 0;
+    }
     if (m_vertices.empty())
         return;
     glBindVertexArray(m_vao);
@@ -1945,6 +2234,8 @@ namespace
         std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     } g_verify;
 
+    std::atomic<uint64_t> g_nativeTriangles{0}; // triangles carrying native VU1 batch data (PS2X_VU1_GPU)
+
     // PS2X_GS_GPU_PRIMLOG=N (with PS2X_GS_GPU_VERIFY and PS2X_DUMP_FRAMES): log every primitive drawn
     // between verified frames N and N+1 to primlog.txt, with its GS state, and dump the comparison of
     // frame N+1, so the draws under differing pixels can be found (tools/gs/primlog_suspects.py).
@@ -2238,7 +2529,8 @@ void GSGpuBackend::PumpHostThread(std::chrono::steady_clock::time_point deadline
     if (s_stats && std::chrono::steady_clock::now() - s_lastSummary > std::chrono::seconds(10))
     {
         s_lastSummary = std::chrono::steady_clock::now();
-        std::cerr << "[gs-gpu] counts:" << m_renderer->UnsupportedSummary() << " | host: pump " << g_host.pumpSeconds << "s outside "
+        std::cerr << "[gs-gpu] counts:" << m_renderer->UnsupportedSummary() << " | native VU1 triangles "
+                  << g_nativeTriangles.load() << " | host: pump " << g_host.pumpSeconds << "s outside "
                   << g_host.outsideSeconds << "s, presents " << g_host.presents.load() << " dropped " << g_host.presentsDropped.load()
                   << ", guest waits " << g_host.backpressureWaits.load() << std::endl;
     }
@@ -2272,6 +2564,8 @@ void GSGpuBackend::Execute(Command &command)
     switch (command.type)
     {
     case CommandType::Submit:
+        if (command.batch.native)
+            g_nativeTriangles.fetch_add(1, std::memory_order_relaxed);
         if (m_shadow && PrimLogging(g_verify.frames))
             LogPrimitive(command.batch);
         r.Draw(command.batch);

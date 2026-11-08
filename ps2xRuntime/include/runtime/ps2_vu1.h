@@ -3,6 +3,9 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
+
+struct NativeVu1Batch;
 
 class GS;
 class PS2Memory;
@@ -224,6 +227,8 @@ private:
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
     XgkickPipeline m_xgkick{};
+    // Attached to the next PATH1 packet this unit sends (the native 1B68 path, PS2X_VU1_GPU).
+    std::shared_ptr<const NativeVu1Batch> m_pendingNative;
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
     std::array<uint64_t, 4> m_accReady{};

@@ -111,7 +111,8 @@ public:
     // The GPU backend when it is the active one (the host loop drives it), else nullptr.
     GSGpuBackend *gpuBackend();
 
-    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    // native: set when the packet is a native VU1 batch's output (its vertices are tagged with it).
+    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, const std::shared_ptr<const NativeVu1Batch> &native = {});
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
@@ -167,6 +168,8 @@ public:
     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
 
 private:
+    std::shared_ptr<const NativeVu1Batch> m_nativePacket; // set while processing a native VU1 batch's packet
+    uint8_t m_nativeNextIndex = 0;
     TraceCounters m_traceCounters;
     void snapshotVRAM();
     void writeRegisterUnlocked(uint8_t regAddr, uint64_t value);

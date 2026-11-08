@@ -1,4 +1,5 @@
 #include "ps2_vu1_lifted.h"
+#include "runtime/gs/gs_types.h"
 
 #include <cmath>
 #include <cstdio>
@@ -39,9 +40,11 @@ namespace
 
     struct Settings
     {
-        bool on = true, verbose = false, corrupt = false;
+        bool on = true, verbose = false, corrupt = false, gpu = false;
         Settings()
         {
+            const char *g = std::getenv("PS2X_VU1_GPU");
+            gpu = g && *g && std::strcmp(g, "0") != 0;
             const char *e = std::getenv("PS2X_VU1_NATIVE");
             on = !(e && std::strcmp(e, "0") == 0);
             const char *v = std::getenv("PS2X_VU1_VERIFY");
@@ -308,6 +311,7 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
     const float stqW = lit ? vf[28][3] : vf[26][3];
 
     VertexOut vo[kMaxVertices];
+    float inputs[kMaxVertices][4][4]; // as loaded, for PS2X_VU1_GPU (the commit overwrites them)
     uint32_t clipOr = 0, clipAnd = 63;
     float lastQ = 0.0f, lastP = 0.0f, lastAcc[4] = {}, lastSp[4] = {}, lastCol[4] = {};
     float lastRaw[3][4] = {}; // position, STQ, RGBA of the last vertex as loaded
@@ -321,6 +325,10 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
         load(a + 1u, N);
         load(a + 2u, T);
         load(a + 3u, C);
+        std::memcpy(inputs[k][0], P, 16);
+        std::memcpy(inputs[k][1], N, 16);
+        std::memcpy(inputs[k][2], T, 16);
+        std::memcpy(inputs[k][3], C, 16);
         for (int c = 0; c < 4; ++c)
         {
             Pn[c] = vnrm(P[c]);
@@ -567,6 +575,46 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
         vu.m_state.pc = exit == Exit::Clip ? 0x2418u : 0x2430u;
         ++(exit == Exit::Clip ? g_stats.clipped : g_stats.extraPass);
         return kLiftContinue;
+    }
+
+    // PS2X_VU1_GPU: the packet carries the batch's inputs and constants so the GPU renderer can
+    // transform and light the vertices itself (the packet is unchanged).
+    if (s_settings.gpu)
+    {
+        static uint32_t s_serial = 0;
+        auto batch = std::make_shared<NativeVu1Batch>();
+        batch->mode = mode;
+        batch->count = n;
+        batch->serial = ++s_serial ? s_serial : ++s_serial;
+        for (int c = 0; c < 4; ++c)
+        {
+            batch->mvp[0][c] = m1[c];
+            batch->mvp[1][c] = m2[c];
+            batch->mvp[2][c] = m3[c];
+            batch->mvp[3][c] = m4[c];
+            batch->rot[0][c] = r8[c];
+            batch->rot[1][c] = r9[c];
+            batch->rot[2][c] = r10[c];
+            batch->scale[c] = s11[c];
+            batch->offset[c] = s12[c];
+            batch->lightDir[0][c] = l13[c];
+            batch->lightDir[1][c] = l14[c];
+            batch->lightDir[2][c] = l15[c];
+            batch->lightCol[0][c] = c16[c];
+            batch->lightCol[1][c] = c17[c];
+            batch->lightCol[2][c] = c18[c];
+            batch->lightCol[3][c] = c19[c];
+            batch->emissive[c] = emissive[c];
+        }
+        batch->stqW = stqW;
+        std::memcpy(batch->in, inputs, sizeof(float) * 16u * n);
+        for (uint32_t k = 0; k < n; ++k)
+        {
+            std::memcpy(batch->out[k][0], vo[k].stq, 16);
+            std::memcpy(batch->out[k][1], vo[k].rgba, 16);
+            std::memcpy(batch->out[k][2], vo[k].xyzf, 16);
+        }
+        vu.m_pendingNative = std::move(batch);
     }
 
     // GIF tag (NLOOP += n), kick, swap the output buffers.
