@@ -132,6 +132,27 @@ float tz(precise double d)
 }
 float vmul(float a, float b) { precise double d = double(a) * double(b); return tz(d); }
 float vadd(float a, float b) { precise double d = double(a) + double(b); return tz(d); }
+// acc + a * b as ps2_vu1_native.cpp's madd (VU1Interpreter's FMAC): the float result, unless it is
+// near the ends of the range, where the exact value decides (so -FLT_MAX + 2e40 is FLT_MAX).
+float tzRaw(precise double d)
+{
+    precise float f = float(d);
+    precise double back = double(f);
+    if (f != 0.0 && !isinf(f) && abs(back) > abs(d)) f = uintBitsToFloat(floatBitsToUint(f) - 1u);
+    if (isinf(f)) f = uintBitsToFloat(floatBitsToUint(f) - 1u);
+    return f;
+}
+float vmadd(float acc, float a, float b)
+{
+    float r = tzRaw(double(acc) + double(tzRaw(double(a) * double(b))));
+    uint e = (floatBitsToUint(r) >> 23) & 255u;
+    if (e - 2u <= 251u) return r;
+    precise double exact = double(acc) + double(a) * double(b);
+    uint sgn = exact < 0.0LF ? 0x80000000u : 0u;
+    if (abs(exact) < 1.1754943508222875e-38LF) return uintBitsToFloat(sgn);
+    if (abs(exact) > 3.4028234663852886e38LF) return uintBitsToFloat(sgn | 0x7F7FFFFFu);
+    return r;
+}
 // GPU double division and square root need not be correctly rounded, so these search for the
 // float that truncation gives, checking each candidate exactly (a product of two floats is exact
 // in double): the largest |q| with |q * w| <= 1, the largest r with r * r <= x.
@@ -158,10 +179,12 @@ float vmul(float a, float b) { return vuc(a * b); }
 float vadd(float a, float b) { return vuc(a + b); }
 float vrcp(float w) { return w == 0.0 ? 3.4028235e38 : vuc(1.0 / w); }
 float vsqrt(float x) { return vuc(sqrt(x)); }
+float vmadd(float acc, float a, float b) { return vadd(acc, vmul(a, b)); }
 #endif
 vec4 mul4(vec4 a, float b) { return vec4(vmul(a.x, b), vmul(a.y, b), vmul(a.z, b), vmul(a.w, b)); }
 vec4 mul4v(vec4 a, vec4 b) { return vec4(vmul(a.x, b.x), vmul(a.y, b.y), vmul(a.z, b.z), vmul(a.w, b.w)); }
 vec4 add4(vec4 a, vec4 b) { return vec4(vadd(a.x, b.x), vadd(a.y, b.y), vadd(a.z, b.z), vadd(a.w, b.w)); }
+vec4 madd4(vec4 acc, vec4 a, float b) { return vec4(vmadd(acc.x, a.x, b), vmadd(acc.y, a.y, b), vmadd(acc.z, a.z, b), vmadd(acc.w, a.w, b)); }
 void main()
 {
     if (uMesh == 0)
@@ -180,24 +203,24 @@ void main()
     // Inputs as the VU reads them: an infinity bit pattern is +-FLT_MAX.
     vec4 P = vuc4(aP), N = vuc4(aN), T = vuc4(aT), C = vuc4(aC);
     // The microprogram's order: ((m1*x + m2*y) + m3*z) + m4*w, each product and sum rounded.
-    vec4 clip = add4(add4(add4(mul4(K(0), P.x), mul4(K(1), P.y)), mul4(K(2), P.z)), mul4(K(3), P.w));
+    vec4 clip = madd4(madd4(madd4(mul4(K(0), P.x), K(1), P.y), K(2), P.z), K(3), P.w);
     float q = vrcp(clip.w);
     vec4 sp = vec4(vmul(clip.x, q), vmul(clip.y, q), vmul(clip.z, q), clip.w);
-    vec4 scr = add4(mul4v(sp, K(7)), K(8));
+    vec4 scr = madd4(mul4v(sp, K(7)), K(8), 1.0);
     vec4 colour;
     if (lit)
     {
-        vec4 nr = add4(add4(mul4(K(4), N.x), mul4(K(5), N.y)), mul4(K(6), N.z));
+        vec4 nr = madd4(madd4(mul4(K(4), N.x), K(5), N.y), K(6), N.z);
         if (misc.w > 0.5)
         {
             float len = vsqrt(vadd(vadd(vmul(nr.x, nr.x), vmul(nr.y, nr.y)), vmul(nr.z, nr.z)));
             float inv = len != 0.0 ? vrcp(len) : 0.0;
             nr = mul4(nr, inv);
         }
-        vec4 L = add4(add4(mul4(K(9), nr.x), mul4(K(10), nr.y)), mul4(K(11), nr.z));
-        vec4 lc = add4(add4(add4(mul4(K(12), L.x), mul4(K(13), L.y)), mul4(K(14), L.z)), mul4(K(15), L.w));
+        vec4 L = madd4(madd4(mul4(K(9), nr.x), K(10), nr.y), K(11), nr.z);
+        vec4 lc = madd4(madd4(madd4(mul4(K(12), L.x), K(13), L.y), K(14), L.z), K(15), L.w);
         vec4 amount = vec4(max(lc.xyz, vec3(0.0)), K(6).w);
-        colour = min(add4(mul4v(C, amount), K(16)), vec4(K(4).w));
+        colour = min(madd4(mul4v(C, amount), K(16), 1.0), vec4(K(4).w));
     }
     else
         colour = vec4(vmul(C.r, K(5).w), vmul(C.g, K(5).w), vmul(C.b, K(5).w), vmul(C.a, K(6).w));
@@ -210,7 +233,9 @@ void main()
     float z = (xyz2 ? float(uint(int(xyzf.z))) : float((int(xyzf.z) >> 4) & 0xFFFFFF)) * (1.0 / 4294967296.0);
     gl_Position = vec4(x / uTargetSize.x * 2.0 - 1.0, y / uTargetSize.y * 2.0 - 1.0, 0.0, 1.0);
     vColor = vec4(lowByte(colour.r), lowByte(colour.g), lowByte(colour.b), lowByte(colour.a));
-    vStq = vec3(vmul(T.x, q), vmul(T.y, q), vmul(T.z, q));
+    // The GS frontend reads a Q of zero as 1 (GSFrontend, STQ).
+    float stqQ = vmul(T.z, q);
+    vStq = vec3(vmul(T.x, q), vmul(T.y, q), stqQ == 0.0 ? 1.0 : stqQ);
     vFog = xyz2 ? aMeshFog.x : float((int(xyzf.w) >> 4) & 255);
     vDepth = z;
     vDepthFlat = z;
@@ -1930,9 +1955,31 @@ namespace
         volatile float p = a * b;
         return p;
     }
+    // ps2_vu1_native.cpp's mul and madd: the float result, unless it is near the ends of the range,
+    // where the exact value decides (overflow clamps, underflow is a signed zero).
+    float vuFix(float r, double exact)
+    {
+        uint32_t b;
+        std::memcpy(&b, &r, 4);
+        if (((b >> 23) & 0xFFu) - 2u <= 251u)
+            return r;
+        const double mag = std::fabs(exact);
+        const float sign = std::signbit(exact) ? -1.0f : 1.0f;
+        if (mag == 0.0 || mag < static_cast<double>(std::numeric_limits<float>::min()))
+            return std::copysign(0.0f, sign);
+        if (mag > static_cast<double>(std::numeric_limits<float>::max()))
+            return sign * std::numeric_limits<float>::max();
+        return r;
+    }
+    float vuMul(float a, float b) { return vuFix(mulNoFma(a, b), static_cast<double>(a) * static_cast<double>(b)); }
+    float vuMadd(float acc, float a, float b)
+    {
+        volatile float r = acc + mulNoFma(a, b);
+        return vuFix(r, static_cast<double>(acc) + static_cast<double>(a) * static_cast<double>(b));
+    }
     float madd4(const float *m0, const float *m1, const float *m2, const float *m3, const float *v, int c)
     {
-        return ((mulNoFma(m0[c], v[0]) + mulNoFma(m1[c], v[1])) + mulNoFma(m2[c], v[2])) + mulNoFma(m3[c], v[3]);
+        return vuMadd(vuMadd(vuMadd(vuMul(m0[c], v[0]), m1[c], v[1]), m2[c], v[2]), m3[c], v[3]);
     }
     // As the VU reads a register: denormals are zero, an infinity/NaN exponent is +-FLT_MAX.
     float vuNorm(float v)
@@ -1989,15 +2036,16 @@ void GSGpuRenderer::CheckMeshVertex(const NativeVu1Batch &nb, const GSVertex &gv
     float clip[4], scr[4], colour[4];
     for (int c = 0; c < 4; ++c)
         clip[c] = madd4(nb.mvp[0], nb.mvp[1], nb.mvp[2], nb.mvp[3], P, c);
-    const float q = clip[3] == 0.0f ? std::numeric_limits<float>::max() : 1.0f / clip[3];
+    // 1 / FLT_MAX is a denormal: the VU flushes it, and the vertex lands on the screen offset.
+    const float q = clip[3] == 0.0f ? std::numeric_limits<float>::max() : vuClamp(1.0f / clip[3]);
     const float sp[4] = {vuClamp(mulNoFma(clip[0], q)), vuClamp(mulNoFma(clip[1], q)), vuClamp(mulNoFma(clip[2], q)), clip[3]};
     for (int c = 0; c < 4; ++c)
-        scr[c] = vuClamp(mulNoFma(sp[c], nb.scale[c])) + nb.offset[c];
+        scr[c] = vuMadd(vuMul(sp[c], nb.scale[c]), nb.offset[c], 1.0f);
     if (lit)
     {
         float nr[3];
         for (int c = 0; c < 3; ++c)
-            nr[c] = (mulNoFma(nb.rot[0][c], N[0]) + mulNoFma(nb.rot[1][c], N[1])) + mulNoFma(nb.rot[2][c], N[2]);
+            nr[c] = vuMadd(vuMadd(vuMul(nb.rot[0][c], N[0]), nb.rot[1][c], N[1]), nb.rot[2][c], N[2]);
         if (normalize)
         {
             const float len = 1.0f / std::sqrt((mulNoFma(nr[0], nr[0]) + mulNoFma(nr[1], nr[1])) + mulNoFma(nr[2], nr[2]));
@@ -2006,12 +2054,12 @@ void GSGpuRenderer::CheckMeshVertex(const NativeVu1Batch &nb, const GSVertex &gv
         }
         float L[4], lc[3];
         for (int c = 0; c < 4; ++c)
-            L[c] = (mulNoFma(nb.lightDir[0][c], nr[0]) + mulNoFma(nb.lightDir[1][c], nr[1])) + mulNoFma(nb.lightDir[2][c], nr[2]);
+            L[c] = vuMadd(vuMadd(vuMul(nb.lightDir[0][c], nr[0]), nb.lightDir[1][c], nr[1]), nb.lightDir[2][c], nr[2]);
         for (int c = 0; c < 3; ++c)
             lc[c] = madd4(nb.lightCol[0], nb.lightCol[1], nb.lightCol[2], nb.lightCol[3], L, c);
         const float amount[4] = {std::max(lc[0], 0.0f), std::max(lc[1], 0.0f), std::max(lc[2], 0.0f), nb.rot[2][3]};
         for (int c = 0; c < 4; ++c)
-            colour[c] = std::min(mulNoFma(C[c], amount[c]) + nb.emissive[c], nb.rot[0][3]);
+            colour[c] = std::min(vuMadd(vuMul(C[c], amount[c]), nb.emissive[c], 1.0f), nb.rot[0][3]);
     }
     else
     {
@@ -2051,7 +2099,7 @@ void GSGpuRenderer::CheckMeshVertex(const NativeVu1Batch &nb, const GSVertex &gv
         const uint32_t vfog = nb.xyz2 ? gv.fog : ((static_cast<uint32_t>(xyzf[3]) >> 4) & 0xFFu);
         const bool same = vx == gv.x && vy == gv.y && vz == gv.z && vfog == gv.fog && (rgba[0] & 0xFF) == gv.r &&
                           (rgba[1] & 0xFF) == gv.g && (rgba[2] & 0xFF) == gv.b && (rgba[3] & 0xFF) == gv.a &&
-                          st[0] == gv.s && st[1] == gv.t && st[2] == gv.q;
+                          st[0] == gv.s && st[1] == gv.t && (st[2] == 0.0f ? 1.0f : st[2]) == gv.q;
         static uint64_t s_gsDiffs = 0;
         if (!same && ++s_gsDiffs <= 20u)
             std::fprintf(stderr, "[vu1-gpu] vs GS: mode %04x xyz2 %d xy %.4f,%.4f/%.4f,%.4f z %.0f/%.0f fog %u/%u rgba %d,%d,%d,%d/%u,%u,%u,%u "
