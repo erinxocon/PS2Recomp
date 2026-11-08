@@ -149,6 +149,10 @@ uniform int uFba;
 uniform int uBlendC;            // 0 As, 1 Ad (unsupported, treated as As), 2 FIX
 uniform float uBlendFix;
 uniform int uAlphaPass;         // 0: all pixels; 1: f <= 1 only; 2: f > 1 only, as Cs*f - Cd*(f-1)
+uniform int uExact;             // 1: blend here, exactly as the GS, from a copy of the target (uDst)
+uniform sampler2D uDst;
+uniform ivec3 uBlendSel;        // A, B, D: 0 Cs, 1 Cd, 2 zero
+uniform int uColClamp;
 uniform float uSrcScale;        // multiplier for the source colour (|cs| of the blend), < 0 = use alpha factor
 uniform int uSrcScaleMode;      // 0: 1, 1: f, 2: 1 - f, 3: 1 + f
 layout(location = 0, index = 0) out vec4 oColor;
@@ -277,6 +281,23 @@ void main()
     float f = (uBlendC == 2 ? uBlendFix : alpha) / 128.0;
     float s = uSrcScaleMode == 0 ? 1.0 : uSrcScaleMode == 1 ? f : uSrcScaleMode == 2 ? 1.0 - f : 1.0 + f;
     if (uFba != 0 && c.a < 128.0) alpha = c.a + 128.0;
+    if (uExact != 0)
+    {
+        // ((A - B) * C >> 7) + D per channel on 8-bit values, then COLCLAMP: nothing saturates
+        // before the end, which GL's blender cannot do for factors above 1.
+        vec4 dst = texelFetch(uDst, ivec2(gl_FragCoord.xy), 0);
+        vec3 cd = floor(dst.rgb * 255.0 + 0.5);
+        float cfac = uBlendC == 2 ? uBlendFix : uBlendC == 1 ? floor(dst.a * 255.0 + 0.5) : c.a;
+        vec3 A = uBlendSel.x == 0 ? c.rgb : uBlendSel.x == 1 ? cd : vec3(0.0);
+        vec3 B = uBlendSel.y == 0 ? c.rgb : uBlendSel.y == 1 ? cd : vec3(0.0);
+        vec3 D = uBlendSel.z == 0 ? c.rgb : uBlendSel.z == 1 ? cd : vec3(0.0);
+        vec3 v = floor((A - B) * cfac / 128.0) + D;
+        v = uColClamp != 0 ? clamp(v, 0.0, 255.0) : mod(v, 256.0);
+        oColor = vec4(v / 255.0, alpha / 255.0);
+        oBlend = vec4(0.0);
+        gl_FragDepth = vDepthConst > 0.5 ? vDepthFlat : vDepth;
+        return;
+    }
     // (Cs - Cd) * f + Cd with f > 1 (alpha above 128) needs a negative destination factor, which GL
     // clamps away: such draws run twice, this half as Cs*f - Cd*(f-1) with a subtracting blend.
     if ((uAlphaPass == 1 && f > 1.0) || (uAlphaPass == 2 && f <= 1.0))
@@ -398,6 +419,7 @@ public:
 
     void Draw(const GSPrimitiveBatch &batch);
     void FlushDraws();
+    void FlushExact();
 
     // Make GS memory current for pages [first, first + count) (or all of it).
     void DownloadOverlapping(uint32_t first, uint32_t count, const char *why = "other");
@@ -481,6 +503,15 @@ private:
 
     GSCpuBackend &m_cpu;
     bool m_glReady = false;
+    // PS2X_GS_GPU_EXACT_BLEND=0: blends with a factor above 1 in two GL passes (inexact where Cs*f
+    // passes 255) instead of in the shader from a copy of the target.
+    bool m_exactBlend = []()
+    {
+        const char *v = std::getenv("PS2X_GS_GPU_EXACT_BLEND");
+        return !(v && std::strcmp(v, "0") == 0);
+    }();
+    GLuint m_dstTex = 0;
+    uint32_t m_dstW = 0, m_dstH = 0;
     GLuint m_program = 0, m_vao = 0, m_vbo = 0;
     std::unordered_map<std::string, GLint> m_uniforms;
     GLint U(const char *name);
@@ -1391,6 +1422,8 @@ void GSGpuRenderer::Draw(const GSPrimitiveBatch &batch)
         Note(st.prim.type == GS_PRIM_POINT ? "points" : "lines");
         break;
     }
+    if (m_exactBlend && m_key.alphaSplit && m_keyColor && !m_vertices.empty())
+        FlushExact();
 }
 
 void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
@@ -1475,6 +1508,7 @@ void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
     // cs * Cs + cd * Cd. The shader outputs Cs * |cs| and the blend factor f = C / 128; GL applies
     // the sign (equation) and |cd| (destination factor).
     glUniform1i(U("uAlphaPass"), key.alphaSplit ? 1 : 0);
+    glUniform1i(U("uExact"), 0);
     if (!key.abe)
     {
         glDisable(GL_BLEND);
@@ -1540,6 +1574,58 @@ void GSGpuRenderer::ApplyKey(const DrawKey &key, Target *color, Target *depth)
     glUniform1i(U("uSrcScaleMode"), srcMode < 0 ? 0 : srcMode);
     glUniform1i(U("uBlendC"), static_cast<GLint>(c));
     glUniform1f(U("uBlendFix"), fix);
+    // Blends with a factor that can exceed 1 are done in the shader, one primitive at a time, from a
+    // copy of the pixels it covers (FlushExact).
+    const bool exact = key.alphaSplit && m_exactBlend && color;
+    glUniform1i(U("uExact"), exact ? 1 : 0);
+    if (exact)
+    {
+        glDisable(GL_BLEND);
+        glUniform1i(U("uAlphaPass"), 0);
+        glUniform3i(U("uBlendSel"), static_cast<GLint>(a), static_cast<GLint>(b), static_cast<GLint>(d));
+        glUniform1i(U("uColClamp"), key.colclamp ? 1 : 0);
+        const uint32_t w = color->width * m_scale, h = color->height * m_scale;
+        glActiveTexture(GL_TEXTURE4);
+        if (!m_dstTex || m_dstW < w || m_dstH < h)
+        {
+            if (!m_dstTex)
+                glGenTextures(1, &m_dstTex);
+            m_dstW = std::max(m_dstW, w);
+            m_dstH = std::max(m_dstH, h);
+            glBindTexture(GL_TEXTURE_2D, m_dstTex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, m_dstW, m_dstH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+        glBindTexture(GL_TEXTURE_2D, m_dstTex);
+        glActiveTexture(GL_TEXTURE0);
+        glUniform1i(U("uDst"), 4);
+    }
+}
+
+void GSGpuRenderer::FlushExact()
+{
+    // Copy what this primitive covers (all earlier primitives are drawn), then draw it alone.
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (const Vertex &v : m_vertices)
+    {
+        x0 = std::min(x0, v.x);
+        y0 = std::min(y0, v.y);
+        x1 = std::max(x1, v.x);
+        y1 = std::max(y1, v.y);
+    }
+    const int w = static_cast<int>(m_keyColor->width), h = static_cast<int>(m_keyColor->height);
+    const int ix0 = std::clamp(static_cast<int>(std::floor(x0)) - 1, 0, w);
+    const int iy0 = std::clamp(static_cast<int>(std::floor(y0)) - 1, 0, h);
+    const int ix1 = std::clamp(static_cast<int>(std::ceil(x1)) + 1, 0, w);
+    const int iy1 = std::clamp(static_cast<int>(std::ceil(y1)) + 1, 0, h);
+    if (ix1 > ix0 && iy1 > iy0)
+    {
+        const int s = static_cast<int>(m_scale);
+        BlitRect(m_keyColor->tex, ix0 * s, iy0 * s, (ix1 - ix0) * s, (iy1 - iy0) * s, m_dstTex, ix0 * s, iy0 * s,
+                 (ix1 - ix0) * s, (iy1 - iy0) * s, false);
+    }
+    FlushDraws();
 }
 
 void GSGpuRenderer::FlushDraws()
@@ -1550,7 +1636,7 @@ void GSGpuRenderer::FlushDraws()
     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_vertices.size() * sizeof(Vertex)), m_vertices.data(), GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_vertices.size()));
-    if (m_key.alphaSplit)
+    if (m_key.alphaSplit && !m_exactBlend)
     {
         // Second half of the blend: Cs*f - Cd*(f-1) for the pixels with f > 1. Not exact where Cs*f
         // is above 255 (the shader output saturates before the subtraction), nor where these
