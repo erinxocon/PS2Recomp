@@ -667,6 +667,18 @@ void GSGpuRenderer::EnsureGl()
     }
     glDeleteShader(vs);
     glDeleteShader(fs);
+    // Every sampler gets its own unit up front: samplers of different types left on the same unit
+    // (they all default to 0) make draws invalid on some drivers.
+    {
+        GLint previous = 0;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &previous);
+        glUseProgram(m_program);
+        glUniform1i(U("uVram"), 0);
+        glUniform1i(U("uSwizzle"), 1);
+        glUniform1i(U("uPalette"), 2);
+        glUniform1i(U("uDst"), 4);
+        glUseProgram(static_cast<GLuint>(previous));
+    }
 
     glGenVertexArrays(1, &m_vao);
     glGenBuffers(1, &m_vbo);
