@@ -101,6 +101,7 @@ layout(location = 7) in vec4 aC;
 layout(location = 8) in vec4 aMesh;       // constants index, XYOFFSET x, y, constant Z
 layout(location = 9) in vec2 aMeshFog;    // FOG register (XYZ2 batches), 1 when the position register is XYZ2
 uniform int uMesh;
+uniform int uSubpixel;                     // PS2X_VU1_GPU_SUBPIXEL: positions not snapped to 1/16 pixel
 uniform samplerBuffer uConsts;             // 18 vec4 per batch, see GSGpuRenderer::AddMeshTriangle
 uniform vec2 uTargetSize;
 noperspective out vec4 vColor;
@@ -257,6 +258,11 @@ void main()
     ivec4 xyzf = ivec4(ftoi(scr.x * 16.0), ftoi(scr.y * 16.0), ftoi(scr.z * 16.0), ftoi(scr.w * 16.0));
     float x = float(xyzf.x & 0xFFFF) / 16.0 - aMesh.y;
     float y = float(xyzf.y & 0xFFFF) / 16.0 - aMesh.z;
+    if (uSubpixel != 0)
+    {
+        x = scr.x - aMesh.y;
+        y = scr.y - aMesh.z;
+    }
     // XYZF2: Z is bits 4-27 of the word and fog bits 4-11 of the next; XYZ2: Z is the whole word.
     bool xyz2 = aMeshFog.y > 0.5;
     float z = (xyz2 ? float(uint(xyzf.z)) : float((xyzf.z >> 4) & 0xFFFFFF)) * (1.0 / 4294967296.0);
@@ -696,6 +702,9 @@ private:
     // against the vertex the GS decoded from the batch's packet.
     bool m_vu1Gpu = envOn("PS2X_VU1_GPU");
     bool m_vu1GpuVerify = envOn("PS2X_VU1_GPU_VERIFY");
+    // PS2X_VU1_GPU_SUBPIXEL=1: draw those vertices at their float screen positions, not the GS's
+    // 1/16-pixel ones (for internal resolutions above 1x; no longer what the CPU rasterizer draws).
+    bool m_vu1GpuSubpixel = envOn("PS2X_VU1_GPU_SUBPIXEL");
     bool m_meshExact = false; // the vertex shader rounds like the VU (fp64 available)
     GLuint m_meshVao = 0, m_meshVbo = 0, m_constBuf = 0, m_constTex = 0;
     std::vector<MeshVertex> m_meshVertices;
@@ -2191,6 +2200,7 @@ void GSGpuRenderer::FlushDraws()
         glBindBuffer(GL_TEXTURE_BUFFER, 0);
         glUniform1i(U("uConsts"), 5);
         glUniform1i(U("uMesh"), 1);
+        glUniform1i(U("uSubpixel"), m_vu1GpuSubpixel ? 1 : 0);
         glBindVertexArray(m_meshVao);
         glBindBuffer(GL_ARRAY_BUFFER, m_meshVbo);
         glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_meshVertices.size() * sizeof(MeshVertex)), m_meshVertices.data(),
