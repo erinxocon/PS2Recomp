@@ -10,6 +10,7 @@
 #include "core/iop_kernel.h"
 #include "imports/iop_loadcore.h"
 #include "core/iop_memory.h"
+#include "lifted/iop_lifted.h"
 #include "services/iop_module_loader.h"
 #include "services/iop_rpc.h"
 #include "imports/iop_stdio.h"
@@ -123,6 +124,7 @@ namespace ps2x::iop::detail
             kernel.setNestedWaitHandler([this](const std::function<bool(uint64_t)> &ready)
                                         { pumpThreadsForNestedWait(ready); });
             modules.clear();
+            lifted.revalidate();
             imports.reset();
             rpc.reset();
             cdvd.reset();
@@ -427,6 +429,16 @@ namespace ps2x::iop::detail
                 return !cpu.stopped;
             }
 
+            if (const uint32_t executed = lifted.run(cpu, [this](CpuState &state)
+                                                     { (void)cpuCore.executeInstruction(state); }))
+            {
+                schedulePendingDma();
+                totalInstructions += executed;
+                totalCycles += executed;
+                return !cpu.stopped;
+            }
+
+            lifted.noteInterpreted(cpu.pc);
             const bool running = cpuCore.executeInstruction(cpu);
             schedulePendingDma();
             ++totalInstructions;
@@ -708,6 +720,7 @@ namespace ps2x::iop::detail
                     write8(args + argumentSize, 0u);
                 }
             }
+            lifted.revalidate();
             const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
             if (args)
                 freeAllocation(args);
@@ -756,6 +769,7 @@ namespace ps2x::iop::detail
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
             modules.erase(it);
+            lifted.revalidate();
             kernel.cleanupDeadThreads();
             if (result)
                 *result = 0;
@@ -776,6 +790,7 @@ namespace ps2x::iop::detail
         IopTimrman timrman;
         IopIoman ioman;
         IopCpuCore cpuCore;
+        IopLifted lifted{memory};
         IopImportRegistry imports;
         IopLoadcore loadcore;
         std::map<int, Module> modules;

@@ -15,6 +15,11 @@ public:
 
     void onVagTransfer(const uint8_t *rdram, uint32_t srcAddr, uint32_t sizeBytes);
     void onVagTransferFromBuffer(const uint8_t *data, uint32_t sizeBytes, uint32_t keyAddr);
+    // How long a sample the SPU2 produces now takes to reach the speaker: audio buffered for the
+    // device plus the device's own buffer (ms). A rhythm game judges against the SPU2's clock, so
+    // this is how late the player hears what the game is judging.
+    double outputDelayMs() const;
+
     void onSoundCommand(uint32_t sid, uint32_t rpcNum,
                         const uint8_t *sendBuf, uint32_t sendSize,
                         uint8_t *recvBuf, uint32_t recvSize);

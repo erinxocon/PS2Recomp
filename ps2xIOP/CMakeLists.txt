@@ -10,6 +10,7 @@ add_library(ps2_iop STATIC
     src/iop_subsystem.cpp
     src/emulator/iop_emulator.cpp
     src/emulator/core/iop_cpu.cpp
+    src/emulator/lifted/iop_lifted.cpp
     src/emulator/core/iop_kernel.cpp
     src/emulator/core/iop_memory.cpp
     src/emulator/core/iop_spu2.cpp

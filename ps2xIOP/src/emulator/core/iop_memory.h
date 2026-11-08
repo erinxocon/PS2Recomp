@@ -42,9 +42,26 @@ namespace ps2x::iop::detail
             uint64_t delayCycles = 0;
         };
 
+        // One guest store, for comparing two executions (PS2X_IOP_LIFT_VERIFY).
+        struct Write
+        {
+            uint32_t address = 0;
+            uint32_t size = 0;
+            uint32_t value = 0;
+            bool operator==(const Write &) const = default;
+        };
+
         IopMemory();
 
         void reset();
+
+        // While set, every top-level read8/16/32 and write8/16/32 (not the accesses one makes
+        // internally) is also appended here, values included.
+        void setJournals(std::vector<Write> *reads, std::vector<Write> *writes)
+        {
+            m_readJournal = reads;
+            m_writeJournal = writes;
+        }
 
         [[nodiscard]] uint8_t read8(uint32_t address) const;
         [[nodiscard]] uint16_t read16(uint32_t address) const;
@@ -80,6 +97,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] IopSpu2 &spu2() const noexcept { return *m_spu2; }
 
     private:
+        mutable std::vector<Write> *m_readJournal = nullptr;
+        std::vector<Write> *m_writeJournal = nullptr;
+        mutable uint32_t m_journalDepth = 0;
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
