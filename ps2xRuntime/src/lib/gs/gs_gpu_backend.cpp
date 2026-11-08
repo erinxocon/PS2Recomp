@@ -132,8 +132,27 @@ float tz(precise double d)
 }
 float vmul(float a, float b) { precise double d = double(a) * double(b); return tz(d); }
 float vadd(float a, float b) { precise double d = double(a) + double(b); return tz(d); }
-float vrcp(float w) { precise double d = 1.0LF / double(w); return w == 0.0 ? (sign(w) < 0.0 ? -3.4028235e38 : 3.4028235e38) : tz(d); }
-float vsqrt(float x) { precise double d = sqrt(double(x)); return tz(d); }
+// GPU double division and square root need not be correctly rounded, so these search for the
+// float that truncation gives, checking each candidate exactly (a product of two floats is exact
+// in double): the largest |q| with |q * w| <= 1, the largest r with r * r <= x.
+float nextUp(float f) { return uintBitsToFloat(floatBitsToUint(f) + 1u); }
+float nextDown(float f) { return uintBitsToFloat(floatBitsToUint(f) - 1u); }
+float vrcp(float w)
+{
+    if (w == 0.0) return sign(w) < 0.0 ? -3.4028235e38 : 3.4028235e38;
+    float q = 1.0 / w;
+    for (int i = 0; i < 4; ++i) { precise double p = double(q) * double(w); if (abs(p) > 1.0LF) q = nextDown(q); else break; }
+    for (int i = 0; i < 4; ++i) { float n = nextUp(q); precise double p = double(n) * double(w); if (abs(p) <= 1.0LF) q = n; else break; }
+    return vuc(q);
+}
+float vsqrt(float x)
+{
+    if (x <= 0.0) return 0.0;
+    float r = sqrt(x);
+    for (int i = 0; i < 4; ++i) { precise double p = double(r) * double(r); if (p > double(x)) r = nextDown(r); else break; }
+    for (int i = 0; i < 4; ++i) { float n = nextUp(r); precise double p = double(n) * double(n); if (p <= double(x)) r = n; else break; }
+    return vuc(r);
+}
 #else
 float vmul(float a, float b) { return vuc(a * b); }
 float vadd(float a, float b) { return vuc(a + b); }
@@ -2104,6 +2123,19 @@ void GSGpuRenderer::FlushDraws()
                                   o[5] == e.rgba[1] && o[6] == e.rgba[2] && o[7] == e.rgba[3] && o[8] == e.stq[0] &&
                                   o[9] == e.stq[1] && o[10] == e.stq[2] && o[11] == e.fog && o[12] == e.depth;
                 ++m_tfChecked;
+                if (!same)
+                {
+                    static uint64_t s_field[5];
+                    s_field[0] += !(std::fabs(x - e.x) < 1e-3f && std::fabs(y - e.y) < 1e-3f);
+                    s_field[1] += !(o[4] == e.rgba[0] && o[5] == e.rgba[1] && o[6] == e.rgba[2] && o[7] == e.rgba[3]);
+                    s_field[2] += !(o[8] == e.stq[0] && o[9] == e.stq[1] && o[10] == e.stq[2]);
+                    s_field[3] += !(o[11] == e.fog);
+                    s_field[4] += !(o[12] == e.depth);
+                    if ((m_tfMismatches & 0xFFFFFu) == 0u)
+                        std::fprintf(stderr, "[vu1-gpu] differing fields: xy %llu rgba %llu stq %llu fog %llu depth %llu; e.g. stq %a %a %a / %a %a %a\n",
+                                     (unsigned long long)s_field[0], (unsigned long long)s_field[1], (unsigned long long)s_field[2],
+                                     (unsigned long long)s_field[3], (unsigned long long)s_field[4], o[8], o[9], o[10], e.stq[0], e.stq[1], e.stq[2]);
+                }
                 if (!same && ++m_tfMismatches <= 20u)
                     std::fprintf(stderr, "[vu1-gpu] GPU vertex %u (mode %04x): xy %.4f,%.4f/%.4f,%.4f rgba %g,%g,%g,%g/%g,%g,%g,%g "
                                          "stq %g,%g,%g/%g,%g,%g fog %g/%g depth %.9g/%.9g\n",
