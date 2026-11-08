@@ -50,6 +50,14 @@ namespace ps2x::iop::detail
 
     uint8_t IopMemory::read8(uint32_t address) const
     {
+        if (m_readJournal && m_journalDepth == 0u)
+        {
+            ++m_journalDepth;
+            const uint8_t value = read8(address);
+            --m_journalDepth;
+            m_readJournal->push_back({address, 1u, value});
+            return value;
+        }
         const uint32_t phys = physicalAddress(address);
         if (phys < RamSize)
             return m_ram[phys];
@@ -63,6 +71,14 @@ namespace ps2x::iop::detail
 
     uint16_t IopMemory::read16(uint32_t address) const
     {
+        if (m_readJournal && m_journalDepth == 0u)
+        {
+            ++m_journalDepth;
+            const uint16_t value = read16(address);
+            --m_journalDepth;
+            m_readJournal->push_back({address, 2u, value});
+            return value;
+        }
         const uint32_t phys = physicalAddress(address);
         if (phys + 1u < RamSize)
         {
@@ -79,6 +95,14 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::read32(uint32_t address) const
     {
+        if (m_readJournal && m_journalDepth == 0u)
+        {
+            ++m_journalDepth;
+            const uint32_t value = read32(address);
+            --m_journalDepth;
+            m_readJournal->push_back({address, 4u, value});
+            return value;
+        }
         const uint32_t phys = physicalAddress(address);
         if ((phys & 3u) == 0u && phys + 3u < RamSize)
         {
@@ -108,6 +132,14 @@ namespace ps2x::iop::detail
 
     void IopMemory::write8(uint32_t address, uint8_t value)
     {
+        if (m_writeJournal && m_journalDepth == 0u)
+        {
+            ++m_journalDepth;
+            write8(address, value);
+            --m_journalDepth;
+            m_writeJournal->push_back({address, 1u, value});
+            return;
+        }
         const uint32_t phys = physicalAddress(address);
         if (phys < RamSize)
         {
@@ -145,6 +177,14 @@ namespace ps2x::iop::detail
 
     void IopMemory::write16(uint32_t address, uint16_t value)
     {
+        if (m_writeJournal && m_journalDepth == 0u)
+        {
+            ++m_journalDepth;
+            write16(address, value);
+            --m_journalDepth;
+            m_writeJournal->push_back({address, 2u, value});
+            return;
+        }
         const uint32_t phys = physicalAddress(address);
         if (phys + 1u < RamSize)
         {
@@ -171,6 +211,14 @@ namespace ps2x::iop::detail
 
     void IopMemory::write32(uint32_t address, uint32_t value)
     {
+        if (m_writeJournal && m_journalDepth == 0u)
+        {
+            ++m_journalDepth;
+            write32(address, value);
+            --m_journalDepth;
+            m_writeJournal->push_back({address, 4u, value});
+            return;
+        }
         const uint32_t phys = physicalAddress(address);
         if ((phys & 3u) == 0u && phys + 3u < RamSize)
         {
