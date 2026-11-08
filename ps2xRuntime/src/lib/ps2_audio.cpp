@@ -1,4 +1,5 @@
 #include "runtime/ps2_audio.h"
+#include "ps2_host_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
 #include "ps2x/iop/iop_audio.h"
@@ -127,6 +128,21 @@ namespace
             }
         }
 
+        bool setPullSource(ps2_host_audio::PullSource source, void *user)
+        {
+            ensureStream();
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_pullSource = source;
+            m_pullUser = user;
+            m_priming = true;
+            return m_streamReady;
+        }
+
+        uint32_t deviceBufferedFrames()
+        {
+            return static_cast<uint32_t>(m_deviceMs * kSampleRate / 1000.0);
+        }
+
         double outputDelayMs()
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -184,6 +200,12 @@ namespace
         void pull(int16_t *out, unsigned int frames)
         {
             std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_pullSource)
+            {
+                m_pullSource(m_pullUser, out, frames);
+                writeDump(out, frames);
+                return;
+            }
             const size_t want = static_cast<size_t>(frames) * 2u;
             size_t fill = (m_write + m_ring.size() - m_read) % m_ring.size();
             const double fillMs = static_cast<double>(fill / 2u) * 1000.0 / kSampleRate;
@@ -395,6 +417,8 @@ namespace
         }
 
         std::mutex m_mutex;
+        ps2_host_audio::PullSource m_pullSource = nullptr;
+        void *m_pullUser = nullptr;
         std::vector<int16_t> m_ring;
         size_t m_read = 0;
         size_t m_write = 0;
@@ -426,6 +450,24 @@ namespace
         uint32_t m_dumpFrames = 0;
         uint32_t m_dumpFramesAtHeader = 0;
     };
+}
+
+namespace ps2_host_audio
+{
+    void push(const int16_t *frames, size_t frameCount)
+    {
+        Spu2HostOutput::instance().push(frames, frameCount);
+    }
+
+    bool setPullSource(PullSource source, void *user)
+    {
+        return Spu2HostOutput::instance().setPullSource(source, user);
+    }
+
+    uint32_t deviceBufferedFrames()
+    {
+        return Spu2HostOutput::instance().deviceBufferedFrames();
+    }
 }
 
 namespace ps2_vag

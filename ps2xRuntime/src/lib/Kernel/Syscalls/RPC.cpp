@@ -582,15 +582,20 @@ namespace ps2_syscalls
                 };
                 uint32_t sw[8], rw[8];
                 words(sendBuf, sendSize, sw);
+                // Opens carry their share flag and base stream (or loop flag) in bytes 0x3E/0x3F.
+                uint32_t sendTail = 0u;
+                if (sendBuf != 0u && sendSize >= 64u)
+                    if (const uint8_t *ptr = getConstMemPtr(rdram, sendBuf + 60u))
+                        std::memcpy(&sendTail, ptr, 4u);
                 words(receiveBuffer, receiveSize, rw);
                 static const auto s_start = std::chrono::steady_clock::now();
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s_start).count();
                 std::fprintf(stderr,
                              "[mstream] t=%.1f tick=%llu ra=%08x fno=0x%x mode=%u ssize=%u rsize=%u send=%08x %08x %08x %08x %08x %08x %08x %08x "
-                             "recv=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                             "recv=%08x %08x %08x %08x %08x %08x %08x %08x tail=%08x\n",
                              ms, static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), getRegU32(ctx, 31), rpcNum,
                              mode, sendSize, receiveSize, sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7], rw[0], rw[1], rw[2],
-                             rw[3], rw[4], rw[5], rw[6], rw[7]);
+                             rw[3], rw[4], rw[5], rw[6], rw[7], sendTail);
             }
 
             if (iopResult.signalNowaitCompletion &&

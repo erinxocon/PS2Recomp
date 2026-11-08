@@ -13,6 +13,7 @@
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
+#include "ps2_native_sound.h"
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <iostream>
@@ -735,6 +736,12 @@ PS2Runtime::~PS2Runtime()
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
 {
+    // With native sound the game's sound drivers are not loaded; ids from 0x7000 mark them.
+    if (ps2_native_sound::replacesModule(path))
+    {
+        static int32_t nextId = 0x7000;
+        return {true, nextId++, 0};
+    }
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
 }
@@ -747,6 +754,12 @@ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddres
 
 bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
 {
+    if (ps2_native_sound::enabled() && moduleId >= 0x7000 && moduleId < 0x7100)
+    {
+        if (result)
+            *result = 0;
+        return true;
+    }
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->stopModule(moduleId, result);
 }
@@ -758,11 +771,15 @@ ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &re
 
 bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 {
+    if (ps2_native_sound::servesSid(sid))
+        return true;
     return m_iopSubsystem->canBindRpc(sid);
 }
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
+    if (ps2_native_sound::servesSid(request.sid))
+        return ps2_native_sound::handleRpc(*this, rdram, request);
     auto scope = m_iopHost->enterCall(ctx, rdram);
     request.callToken = scope.token();
     return m_iopSubsystem->handleRpc(request);
@@ -770,12 +787,14 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
 
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
+    ps2_native_sound::onSifTransfer(rdram, transfer);
     auto scope = m_iopHost->enterCall(nullptr, rdram);
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
+    ps2_native_sound::advanceEeCycles(eeCycles);
     m_iopSubsystem->runEeCycles(eeCycles);
 }
 

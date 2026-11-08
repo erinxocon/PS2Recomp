@@ -1,6 +1,7 @@
 #include "runtime/ee_scheduler.h"
 
 #include "ps2_log.h"
+#include "../ps2_native_sound.h"
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
@@ -1994,6 +1995,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         m_vsyncFlagAddress = 0u;
         m_vsyncTickAddress = 0u;
         completeVSync(m_vsyncTick);
+        ps2_native_sound::onVBlank();
         if (m_gsVSyncCallback != 0u && m_runtime.hasFunction(m_gsVSyncCallback))
         {
             GuestInvocation invocation{};
