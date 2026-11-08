@@ -1106,13 +1106,19 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    if (!m_pendingNative && m_extraNative)
+        m_pendingNative = VU1Lifted::extraPassBatch(*this, m_xgkick.packet.data(), m_xgkick.totalBytes);
+    if (!m_pendingNative && m_clipNative)
+        m_pendingNative = VU1Lifted::emittedBatch(*this, m_xgkick.packet.data(), m_xgkick.totalBytes);
     if (m_gifCaptureFn)
         m_gifCaptureFn(m_gifCaptureCtx, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeMemory)
-        m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+        m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes, true, false,
+                                        std::move(m_pendingNative));
     else if (m_activeGs)
         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
     m_xgkick.active = false;
+    m_pendingNative.reset();
 }
 
 void VU1Interpreter::startXgkick(uint32_t qwordAddress)

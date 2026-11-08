@@ -1,10 +1,13 @@
 #include "ps2_vu1_lifted.h"
+#include "runtime/gs/gs_types.h"
 
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 
 // Native C++ for Gitaroo Man's VU1 mesh renderer, entry 0x1B68 (99.9% of all VU1 work), in the
 // spirit of the Ace Combat 5 port's rn_vp: instead of executing the microprogram, read the vertex
@@ -39,9 +42,13 @@ namespace
 
     struct Settings
     {
-        bool on = true, verbose = false, corrupt = false;
+        bool on = true, verbose = false, corrupt = false, gpu = false, gpuVerify = false;
         Settings()
         {
+            const char *g = std::getenv("PS2X_VU1_GPU");
+            gpu = g && *g && std::strcmp(g, "0") != 0;
+            const char *gv = std::getenv("PS2X_VU1_GPU_VERIFY");
+            gpuVerify = gv && *gv && std::strcmp(gv, "0") != 0;
             const char *e = std::getenv("PS2X_VU1_NATIVE");
             on = !(e && std::strcmp(e, "0") == 0);
             const char *v = std::getenv("PS2X_VU1_VERIFY");
@@ -209,9 +216,26 @@ namespace
     };
 }
 
+namespace
+{
+    const Settings &settings()
+    {
+        static const Settings s;
+        return s;
+    }
+
+    uint32_t nextSerial()
+    {
+        static uint32_t s_serial = 0;
+        return ++s_serial ? s_serial : ++s_serial;
+    }
+}
+
 int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
 {
-    static const Settings s_settings;
+    const Settings &s_settings = settings();
+    vu.m_clipNative.reset();
+    vu.m_extraNative.reset();
     if (!s_settings.on)
         return kLiftNotLifted;
 
@@ -308,6 +332,7 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
     const float stqW = lit ? vf[28][3] : vf[26][3];
 
     VertexOut vo[kMaxVertices];
+    float inputs[kMaxVertices][4][4]; // as loaded, for PS2X_VU1_GPU (the commit overwrites them)
     uint32_t clipOr = 0, clipAnd = 63;
     float lastQ = 0.0f, lastP = 0.0f, lastAcc[4] = {}, lastSp[4] = {}, lastCol[4] = {};
     float lastRaw[3][4] = {}; // position, STQ, RGBA of the last vertex as loaded
@@ -321,6 +346,10 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
         load(a + 1u, N);
         load(a + 2u, T);
         load(a + 3u, C);
+        std::memcpy(inputs[k][0], P, 16);
+        std::memcpy(inputs[k][1], N, 16);
+        std::memcpy(inputs[k][2], T, 16);
+        std::memcpy(inputs[k][3], C, 16);
         for (int c = 0; c < 4; ++c)
         {
             Pn[c] = vnrm(P[c]);
@@ -548,6 +577,57 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
     vi[14] = static_cast<int16_t>(outBase + 3 * static_cast<int32_t>(n + 1u));
     vi[15] = extraPass;
 
+    // PS2X_VU1_GPU: the packet carries the batch's inputs and constants so the GPU renderer can
+    // transform and light the vertices itself (the packet is unchanged).
+    auto makeGpuBatch = [&]
+    {
+        auto batch = std::make_shared<NativeVu1Batch>();
+        batch->mode = mode;
+        batch->count = n;
+        batch->serial = nextSerial();
+        for (int c = 0; c < 4; ++c)
+        {
+            batch->mvp[0][c] = m1[c];
+            batch->mvp[1][c] = m2[c];
+            batch->mvp[2][c] = m3[c];
+            batch->mvp[3][c] = m4[c];
+            batch->rot[0][c] = r8[c];
+            batch->rot[1][c] = r9[c];
+            batch->rot[2][c] = r10[c];
+            batch->scale[c] = s11[c];
+            batch->offset[c] = s12[c];
+            batch->lightDir[0][c] = l13[c];
+            batch->lightDir[1][c] = l14[c];
+            batch->lightDir[2][c] = l15[c];
+            batch->lightCol[0][c] = c16[c];
+            batch->lightCol[1][c] = c17[c];
+            batch->lightCol[2][c] = c18[c];
+            batch->lightCol[3][c] = c19[c];
+            batch->emissive[c] = emissive[c];
+        }
+        {
+            // The packet's register list (the template tag's REGS): which one carries the position.
+            uint32_t lanes[4];
+            std::memcpy(lanes, tag, 16);
+            const uint32_t nreg = (lanes[1] >> 28) ? (lanes[1] >> 28) : 16u;
+            const uint64_t regs = static_cast<uint64_t>(lanes[2]) | (static_cast<uint64_t>(lanes[3]) << 32);
+            for (uint32_t r = 0; r < nreg; ++r)
+            {
+                const uint32_t id = static_cast<uint32_t>(regs >> (4u * r)) & 0xFu;
+                if (id == 0x5u)
+                    batch->xyz2 = true;
+            }
+        }
+        std::memcpy(batch->in, inputs, sizeof(float) * 16u * n);
+        for (uint32_t k = 0; k < n; ++k)
+        {
+            std::memcpy(batch->out[k][0], vo[k].stq, 16);
+            std::memcpy(batch->out[k][1], vo[k].rgba, 16);
+            std::memcpy(batch->out[k][2], vo[k].xyzf, 16);
+        }
+        return batch;
+    };
+
     vu.m_cycle += (normalize ? 40u : 30u) + n * (normalize ? 32u : 26u);
     if (culled)
     {
@@ -566,8 +646,29 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
         vi[13] = static_cast<int16_t>(outBase + 2);
         vu.m_state.pc = exit == Exit::Clip ? 0x2418u : 0x2430u;
         ++(exit == Exit::Clip ? g_stats.clipped : g_stats.extraPass);
+        if (s_settings.gpu)
+        {
+            // An extra pass rewrites the output's STQ before the kick (extraPassBatch); the clipper's
+            // packets, after either branch, come from the emitter (emittedBatch).
+            if (exit == Exit::ExtraPass)
+            {
+                vu.m_extraNative = makeGpuBatch();
+                vu.m_extraNative->stqFromPacket = true;
+            }
+            auto clipBatch = std::make_shared<NativeVu1Batch>();
+            clipBatch->mode = mode;
+            clipBatch->emitted = true;
+            std::memcpy(clipBatch->scale, s11, 16);
+            std::memcpy(clipBatch->offset, s12, 16);
+            vu.m_clipNative = std::move(clipBatch);
+            vu.m_clipTop = top;
+            vu.m_clipCount = n;
+        }
         return kLiftContinue;
     }
+
+    if (s_settings.gpu)
+        vu.m_pendingNative = makeGpuBatch();
 
     // GIF tag (NLOOP += n), kick, swap the output buffers.
     const int16_t kickAt = static_cast<int16_t>(outBase + 2);
@@ -584,4 +685,136 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
     vu.m_state.pc = 0x27E8u;
     ++g_stats.drawn;
     return kLiftEnd;
+}
+
+// The emitter (0x0688) writes, per vertex read at src (+0 clip position, +1.w Q, +2 STQ, +3 colour):
+// STQ = STQ.xyz * Q, RGBA = FTOI0(colour), XYZF = FTOI4((clip.xyz * Q, clip.w) * vf11 + vf12). Its
+// source is the batch's own slots (unclipped triangles of a strip or list) or the clipper's output
+// (266 or 326); rather than follow the program's registers this looks for the vertices that give
+// every word of the packet.
+namespace
+{
+    // One packed GIF tag with STQ, RGBA, XYZF2 or XYZ2 per vertex, as 1B68 and the emitter send:
+    // the vertex count (0 if the packet is something else); xyz2 when the position is XYZ2.
+    uint32_t meshPacketVertices(const uint8_t *packet, uint32_t bytes, bool &xyz2)
+    {
+        if (bytes < 16u)
+            return 0u;
+        uint64_t lo, hi;
+        std::memcpy(&lo, packet, 8);
+        std::memcpy(&hi, packet + 8, 8);
+        const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+        const bool eop = ((lo >> 15) & 1u) != 0u;
+        const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u), nreg = static_cast<uint32_t>(lo >> 60);
+        const uint32_t posReg = static_cast<uint32_t>((hi >> 8) & 0xFu);
+        if (!eop || flg != 0u || nreg != 3u || (hi & 0xFFu) != 0x12u || (posReg != 4u && posReg != 5u) ||
+            nloop == 0u || nloop > kMaxVertices || bytes != 16u + 48u * nloop)
+            return 0u;
+        xyz2 = posReg == 5u;
+        return nloop;
+    }
+}
+
+std::shared_ptr<const NativeVu1Batch> VU1Lifted::extraPassBatch(VU1Interpreter &vu, const uint8_t *packet,
+                                                                uint32_t bytes)
+{
+    // Only the first packet after the extra pass can be its kick (with clipping it is the clipper's).
+    std::shared_ptr<NativeVu1Batch> owned = std::move(vu.m_extraNative);
+    vu.m_extraNative.reset();
+    NativeVu1Batch &batch = *owned;
+    bool xyz2 = false;
+    const uint32_t n = meshPacketVertices(packet, bytes, xyz2);
+    bool same = n == batch.count;
+    for (uint32_t k = 0; same && k < n; ++k)
+        same = std::memcmp(batch.out[k][1], packet + 16u + 48u * k + 16u, 32) == 0;
+    static uint64_t s_found = 0, s_missed = 0;
+    ++(same ? s_found : s_missed);
+    if (settings().gpuVerify && ((s_found + s_missed) & 0xFFFFu) == 0u)
+        std::fprintf(stderr, "[vu1-native] extra-pass packets described for the GPU: %llu, not: %llu\n",
+                     static_cast<unsigned long long>(s_found), static_cast<unsigned long long>(s_missed));
+    if (!same)
+        return nullptr;
+    batch.xyz2 = xyz2;
+    for (uint32_t k = 0; k < n; ++k)
+    {
+        std::memcpy(batch.in[k][2], packet + 16u + 48u * k, 16);
+        std::memcpy(batch.out[k][0], packet + 16u + 48u * k, 16);
+    }
+    return owned;
+}
+
+std::shared_ptr<const NativeVu1Batch> VU1Lifted::emittedBatch(const VU1Interpreter &vu, const uint8_t *packet,
+                                                              uint32_t bytes)
+{
+    const NativeVu1Batch &clipBatch = *vu.m_clipNative;
+    if (!vu.m_activeVuData)
+        return nullptr;
+    bool xyz2 = false;
+    const uint32_t nloop = meshPacketVertices(packet, bytes, xyz2);
+    if (nloop == 0u)
+        return nullptr;
+
+    const uint8_t *mem = vu.m_activeVuData;
+    const uint32_t qmask = (vu.m_activeVuDataSize >> 4) - 1u;
+    const float *s11 = clipBatch.scale, *s12 = clipBatch.offset;
+    // Recomputes vertex k from the qwords at src; true if it gives the packet's words.
+    auto matches = [&](uint32_t src, uint32_t k)
+    {
+        float M[4][4];
+        for (uint32_t i = 0; i < 4u; ++i)
+            std::memcpy(M[i], mem + ((src + i) & qmask) * 16u, 16);
+        const float Q = vnrm(M[1][3]);
+        float v23[4], words[3][4];
+        for (int c = 0; c < 3; ++c)
+            v23[c] = mul(vnrm(M[0][c]), Q);
+        v23[3] = mul(vnrm(M[0][3]), 1.0f);
+        for (int c = 0; c < 3; ++c)
+            words[0][c] = mul(vnrm(M[2][c]), Q);
+        for (int c = 0; c < 4; ++c)
+        {
+            words[1][c] = vftoi(vnrm(M[3][c]), 1.0);
+            words[2][c] = vftoi(madd(mul(v23[c], s11[c]), s12[c], 1.0f), 16.0);
+        }
+        const uint8_t *want = packet + 16u + 48u * k;
+        return std::memcmp(words[0], want, 12) == 0 && std::memcmp(words[1], want + 16, 32) == 0;
+    };
+
+    const int previousRounding = std::fegetround();
+    std::fesetround(FE_TOWARDZERO);
+    uint32_t found = ~0u;
+    auto tryFrom = [&](uint32_t start)
+    {
+        for (uint32_t k = 0; k < nloop; ++k)
+            if (!matches(start + 4u * k, k))
+                return false;
+        found = start;
+        return true;
+    };
+    bool ok = tryFrom(266u) || tryFrom(326u);
+    for (uint32_t j = 0; !ok && j + nloop <= vu.m_clipCount; ++j)
+        ok = tryFrom(vu.m_clipTop + 4u * j);
+    std::fesetround(previousRounding);
+    static uint64_t s_found = 0, s_missed = 0;
+    ++(ok ? s_found : s_missed);
+    if (settings().gpuVerify && ((s_found + s_missed) & 0xFFFFu) == 0u)
+        std::fprintf(stderr, "[vu1-native] clipper packets described for the GPU: %llu, not: %llu\n",
+                     static_cast<unsigned long long>(s_found), static_cast<unsigned long long>(s_missed));
+    if (!ok)
+        return nullptr;
+
+    auto batch = std::make_shared<NativeVu1Batch>();
+    batch->mode = clipBatch.mode;
+    batch->emitted = true;
+    batch->count = nloop;
+    batch->serial = nextSerial();
+    std::memcpy(batch->scale, s11, 16);
+    std::memcpy(batch->offset, s12, 16);
+    batch->xyz2 = xyz2;
+    for (uint32_t k = 0; k < nloop; ++k)
+    {
+        for (uint32_t i = 0; i < 4u; ++i)
+            std::memcpy(batch->in[k][i], mem + ((found + 4u * k + i) & qmask) * 16u, 16);
+        std::memcpy(batch->out[k], packet + 16u + 48u * k, 48);
+    }
+    return batch;
 }

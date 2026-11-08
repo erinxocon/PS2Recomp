@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <array>
+#include <memory>
 #include <cstdint>
 #include <vector>
 
@@ -115,6 +116,34 @@ struct GSVertex
     uint16_t u = 0;
     uint16_t v = 0;
     uint8_t fog = 0;
+    // Set when the vertex came from a native VU1 batch's packet (NativeVu1Batch::serial) and which
+    // of its vertices it is.
+    uint32_t nativeSerial = 0;
+    uint8_t nativeIndex = 0;
+};
+
+// Inputs of one VU1 mesh batch (microprogram entry 1B68, drawn without clipping), passed along
+// with its GIF packet so a GPU renderer can transform and light the vertices itself. With `emitted`,
+// one packet of a clipped batch instead: what the microprogram's emitter (0x0688) read for each
+// vertex it wrote -- clip position, (-, -, -, Q), STQ, colour -- of which only scale and offset are
+// needed besides.
+struct NativeVu1Batch
+{
+    uint32_t mode = 0;           // render body: 0x1B80 lit, 0x1E10 lit + normalized, 0x2108 / 0x2280 prelit
+    uint32_t count = 0;          // vertices (at most 24)
+    uint32_t serial = 0;
+    float mvp[4][4]{};           // vf1-vf4 (columns)
+    float rot[3][4]{};           // vf8-vf10; w: colour clamp, unlit colour scale, alpha scale
+    float scale[4]{};            // vf11 (w: fog scale)
+    float offset[4]{};           // vf12 (w: fog offset)
+    float lightDir[3][4]{};      // vf13-vf15
+    float lightCol[4][4]{};      // vf16-vf19
+    float emissive[4]{};         // data[25]
+    bool xyz2 = false;           // the packet's position register is XYZ2 (32-bit Z, fog from FOG), not XYZF2
+    bool emitted = false;
+    bool stqFromPacket = false;  // an extra pass rewrote the STQ: in[k][2] is the packet's STQ, used as is
+    float in[24][4][4]{};        // per vertex: position, normal, STQ, RGBA as loaded
+    uint32_t out[24][3][4]{};    // per vertex: the packet's STQ, RGBA, XYZF words (for verification)
 };
 
 struct GSFrameReg
@@ -254,6 +283,7 @@ struct GSPrimitiveBatch
     std::array<GSVertex, 3> vertices{};
     uint8_t vertexCount = 0;
     GSDrawState state{};
+    std::shared_ptr<const NativeVu1Batch> native; // all vertices come from this batch
 };
 
 struct GSTransferCommand

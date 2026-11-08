@@ -964,9 +964,16 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, const std::shared_ptr<const NativeVu1Batch> &native)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    struct NativeScope
+    {
+        GS &gs;
+        ~NativeScope() { gs.m_nativePacket.reset(); }
+    } nativeScope{*this};
+    m_nativePacket = native;
+    m_nativeNextIndex = 0;
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
@@ -1267,6 +1274,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         vtx.u = m_curU;
         vtx.v = m_curV;
         vtx.fog = f;
+        vtx.nativeSerial = m_nativePacket ? m_nativePacket->serial : 0u;
+        vtx.nativeIndex = m_nativeNextIndex++;
         vertexKick(!adk);
         break;
     }
@@ -1304,6 +1313,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         vtx.u = m_curU;
         vtx.v = m_curV;
         vtx.fog = m_curFog;
+        vtx.nativeSerial = m_nativePacket ? m_nativePacket->serial : 0u;
+        vtx.nativeIndex = m_nativeNextIndex++;
         vertexKick(!adk);
         break;
     }
@@ -1338,6 +1349,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         vtx.u = m_curU;
         vtx.v = m_curV;
         vtx.fog = static_cast<uint8_t>((hi >> 36) & 0xFF);
+        vtx.nativeSerial = m_nativePacket ? m_nativePacket->serial : 0u;
+        vtx.nativeIndex = m_nativeNextIndex++;
         vertexKick(false);
         break;
     }
@@ -1369,6 +1382,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         vtx.u = m_curU;
         vtx.v = m_curV;
         vtx.fog = m_curFog;
+        vtx.nativeSerial = m_nativePacket ? m_nativePacket->serial : 0u;
+        vtx.nativeIndex = m_nativeNextIndex++;
         vertexKick(false);
         break;
     }
@@ -1517,6 +1532,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         vtx.y = static_cast<float>((value >> 16) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<double>((value >> 32) & 0xFFFFFF);
         vtx.fog = static_cast<uint8_t>((value >> 56) & 0xFF);
+        vtx.nativeSerial = m_nativePacket ? m_nativePacket->serial : 0u;
+        vtx.nativeIndex = m_nativeNextIndex++;
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1546,6 +1563,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         vtx.u = m_curU;
         vtx.v = m_curV;
         vtx.fog = m_curFog;
+        vtx.nativeSerial = m_nativePacket ? m_nativePacket->serial : 0u;
+        vtx.nativeIndex = m_nativeNextIndex++;
         vertexKick(regAddr == GS_REG_XYZ2);
         break;
     }
@@ -2031,6 +2050,14 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
 {
     GSPrimitiveBatch batch{};
     batch.vertexCount = static_cast<uint8_t>(std::min(vertexCount, 3));
+    if (m_nativePacket)
+    {
+        bool fromBatch = true;
+        for (int i = 0; i < vertexCount && i < 3; ++i)
+            fromBatch &= m_vtxQueue[i].nativeSerial == m_nativePacket->serial;
+        if (fromBatch)
+            batch.native = m_nativePacket;
+    }
     for (int i = 0; i < batch.vertexCount; ++i)
         batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[i];
     batch.state.context = m_ctx[m_prim.ctxt ? 1 : 0];

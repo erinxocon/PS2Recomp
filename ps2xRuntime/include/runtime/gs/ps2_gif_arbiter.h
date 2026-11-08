@@ -3,7 +3,10 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
+
+struct NativeVu1Batch;
 
 enum class GifPathId : uint8_t
 {
@@ -18,19 +21,21 @@ struct GifArbiterPacket
     bool path2DirectHl = false;
     bool path3Image = false;
     std::vector<uint8_t> data;
+    std::shared_ptr<const NativeVu1Batch> native;
 };
 
 class GifArbiter
 {
 public:
-    using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
+    using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t, const std::shared_ptr<const NativeVu1Batch> &)>;
 
     GifArbiter() = default;
     explicit GifArbiter(ProcessPacketFn processFn);
 
     void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
 
-    void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
+    void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false,
+                std::shared_ptr<const NativeVu1Batch> native = {});
 
     void drain();
     bool empty() const { return m_queue.empty(); }
