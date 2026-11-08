@@ -110,7 +110,9 @@ noperspective out float vDepth;
 flat out float vDepthFlat;
 flat out float vDepthConst;
 vec4 K(int i) { return texelFetch(uConsts, int(aMesh.x) * 18 + i); }
-float lowByte(float v) { return float(int(v) & 255); }
+// FTOIn saturates (int() of an out-of-range float is undefined in GLSL).
+int ftoi(float v) { return v >= 2147483648.0 ? 0x7FFFFFFF : v <= -2147483648.0 ? int(0x80000000u) : int(v); }
+float lowByte(float v) { return float(ftoi(v) & 255); }
 // VU arithmetic: no infinity (overflow is +-FLT_MAX), denormals are zero, and with VU_EXACT every
 // operation rounds toward zero like the VU (done in double, then truncated to float).
 float vuc(float f)
@@ -198,45 +200,57 @@ void main()
         vDepthConst = aFogZconst.y;
         return;
     }
-    vec4 misc = K(17);                     // mode, STQ w, lit, normalize
-    bool lit = misc.z > 0.5;
+    vec4 misc = K(17);                     // mode, STQ w, body (0 prelit, 1 lit, 2 emitted), normalize
+    bool lit = misc.z > 0.5 && misc.z < 1.5;
     // Inputs as the VU reads them: an infinity bit pattern is +-FLT_MAX.
     vec4 P = vuc4(aP), N = vuc4(aN), T = vuc4(aT), C = vuc4(aC);
-    // The microprogram's order: ((m1*x + m2*y) + m3*z) + m4*w, each product and sum rounded.
-    vec4 clip = madd4(madd4(madd4(mul4(K(0), P.x), K(1), P.y), K(2), P.z), K(3), P.w);
-    float q = vrcp(clip.w);
-    vec4 sp = vec4(vmul(clip.x, q), vmul(clip.y, q), vmul(clip.z, q), clip.w);
-    vec4 scr = madd4(mul4v(sp, K(7)), K(8), 1.0);
-    vec4 colour;
-    if (lit)
+    vec4 scr, colour;
+    float q;
+    if (misc.z > 1.5)
     {
-        vec4 nr = madd4(madd4(mul4(K(4), N.x), K(5), N.y), K(6), N.z);
-        if (misc.w > 0.5)
-        {
-            float len = vsqrt(vadd(vadd(vmul(nr.x, nr.x), vmul(nr.y, nr.y)), vmul(nr.z, nr.z)));
-            float inv = len != 0.0 ? vrcp(len) : 0.0;
-            nr = mul4(nr, inv);
-        }
-        vec4 L = madd4(madd4(mul4(K(9), nr.x), K(10), nr.y), K(11), nr.z);
-        vec4 lc = madd4(madd4(madd4(mul4(K(12), L.x), K(13), L.y), K(14), L.z), K(15), L.w);
-        vec4 amount = vec4(max(lc.xyz, vec3(0.0)), K(6).w);
-        colour = min(madd4(mul4v(C, amount), K(16), 1.0), vec4(K(4).w));
+        // A clipper packet (NativeVu1Batch::emitted): the emitter's arithmetic on what it read.
+        q = N.w;
+        vec4 v = vec4(vmul(P.x, q), vmul(P.y, q), vmul(P.z, q), vmul(P.w, 1.0));
+        scr = madd4(mul4v(v, K(7)), K(8), 1.0);
+        colour = C;
     }
     else
-        colour = vec4(vmul(C.r, K(5).w), vmul(C.g, K(5).w), vmul(C.b, K(5).w), vmul(C.a, K(6).w));
+    {
+        // The microprogram's order: ((m1*x + m2*y) + m3*z) + m4*w, each product and sum rounded.
+        vec4 clip = madd4(madd4(madd4(mul4(K(0), P.x), K(1), P.y), K(2), P.z), K(3), P.w);
+        q = vrcp(clip.w);
+        vec4 sp = vec4(vmul(clip.x, q), vmul(clip.y, q), vmul(clip.z, q), clip.w);
+        scr = madd4(mul4v(sp, K(7)), K(8), 1.0);
+        if (lit)
+        {
+            vec4 nr = madd4(madd4(mul4(K(4), N.x), K(5), N.y), K(6), N.z);
+            if (misc.w > 0.5)
+            {
+                float len = vsqrt(vadd(vadd(vmul(nr.x, nr.x), vmul(nr.y, nr.y)), vmul(nr.z, nr.z)));
+                float inv = len != 0.0 ? vrcp(len) : 0.0;
+                nr = mul4(nr, inv);
+            }
+            vec4 L = madd4(madd4(mul4(K(9), nr.x), K(10), nr.y), K(11), nr.z);
+            vec4 lc = madd4(madd4(madd4(mul4(K(12), L.x), K(13), L.y), K(14), L.z), K(15), L.w);
+            vec4 amount = vec4(max(lc.xyz, vec3(0.0)), K(6).w);
+            colour = min(madd4(mul4v(C, amount), K(16), 1.0), vec4(K(4).w));
+        }
+        else
+            colour = vec4(vmul(C.r, K(5).w), vmul(C.g, K(5).w), vmul(C.b, K(5).w), vmul(C.a, K(6).w));
+    }
     // What the GS takes from the packed STQ, RGBA (FTOI0) and XYZF2 (FTOI4) words.
-    vec4 xyzf = clamp(trunc(scr * 16.0), vec4(-2147483648.0), vec4(2147483520.0)); // FTOI4 saturates
-    float x = float(int(xyzf.x) & 0xFFFF) / 16.0 - aMesh.y;
-    float y = float(int(xyzf.y) & 0xFFFF) / 16.0 - aMesh.z;
+    ivec4 xyzf = ivec4(ftoi(scr.x * 16.0), ftoi(scr.y * 16.0), ftoi(scr.z * 16.0), ftoi(scr.w * 16.0));
+    float x = float(xyzf.x & 0xFFFF) / 16.0 - aMesh.y;
+    float y = float(xyzf.y & 0xFFFF) / 16.0 - aMesh.z;
     // XYZF2: Z is bits 4-27 of the word and fog bits 4-11 of the next; XYZ2: Z is the whole word.
     bool xyz2 = aMeshFog.y > 0.5;
-    float z = (xyz2 ? float(uint(int(xyzf.z))) : float((int(xyzf.z) >> 4) & 0xFFFFFF)) * (1.0 / 4294967296.0);
+    float z = (xyz2 ? float(uint(xyzf.z)) : float((xyzf.z >> 4) & 0xFFFFFF)) * (1.0 / 4294967296.0);
     gl_Position = vec4(x / uTargetSize.x * 2.0 - 1.0, y / uTargetSize.y * 2.0 - 1.0, 0.0, 1.0);
     vColor = vec4(lowByte(colour.r), lowByte(colour.g), lowByte(colour.b), lowByte(colour.a));
     // The GS frontend reads a Q of zero as 1 (GSFrontend, STQ).
     float stqQ = vmul(T.z, q);
     vStq = vec3(vmul(T.x, q), vmul(T.y, q), stqQ == 0.0 ? 1.0 : stqQ);
-    vFog = xyz2 ? aMeshFog.x : float((int(xyzf.w) >> 4) & 255);
+    vFog = xyz2 ? aMeshFog.x : float((xyzf.w >> 4) & 255);
     vDepth = z;
     vDepthFlat = z;
     vDepthConst = aMesh.w;
@@ -1909,7 +1923,8 @@ void GSGpuRenderer::AddMeshTriangle(const GSPrimitiveBatch &batch, bool zconst, 
         for (const auto &c : nb.lightCol)
             put(c);
         put(nb.emissive);
-        const float misc[4] = {static_cast<float>(nb.mode), nb.stqW, lit ? 1.0f : 0.0f, normalize ? 1.0f : 0.0f};
+        const float body = nb.emitted ? 2.0f : lit ? 1.0f : 0.0f;
+        const float misc[4] = {static_cast<float>(nb.mode), nb.stqW, body, normalize ? 1.0f : 0.0f};
         put(misc);
     }
     const float slot = static_cast<float>(m_meshConstants.size() / 4u / kMeshConstantTexels - 1u);
@@ -2033,41 +2048,62 @@ void GSGpuRenderer::CheckMeshVertex(const NativeVu1Batch &nb, const GSVertex &gv
     }
     const bool lit = nb.mode == 0x1B80u || nb.mode == 0x1E10u;
     const bool normalize = nb.mode == 0x1E10u || nb.mode == 0x2280u;
-    float clip[4], scr[4], colour[4];
-    for (int c = 0; c < 4; ++c)
-        clip[c] = madd4(nb.mvp[0], nb.mvp[1], nb.mvp[2], nb.mvp[3], P, c);
-    // 1 / FLT_MAX is a denormal: the VU flushes it, and the vertex lands on the screen offset.
-    const float q = clip[3] == 0.0f ? std::numeric_limits<float>::max() : vuClamp(1.0f / clip[3]);
-    const float sp[4] = {vuClamp(mulNoFma(clip[0], q)), vuClamp(mulNoFma(clip[1], q)), vuClamp(mulNoFma(clip[2], q)), clip[3]};
-    for (int c = 0; c < 4; ++c)
-        scr[c] = vuMadd(vuMul(sp[c], nb.scale[c]), nb.offset[c], 1.0f);
-    if (lit)
+    float scr[4], colour[4], q;
+    if (nb.emitted)
     {
-        float nr[3];
-        for (int c = 0; c < 3; ++c)
-            nr[c] = vuMadd(vuMadd(vuMul(nb.rot[0][c], N[0]), nb.rot[1][c], N[1]), nb.rot[2][c], N[2]);
-        if (normalize)
+        // A clipper packet: the emitter's arithmetic on what it read.
+        q = N[3];
+        const float v[4] = {vuMul(P[0], q), vuMul(P[1], q), vuMul(P[2], q), vuMul(P[3], 1.0f)};
+        for (int c = 0; c < 4; ++c)
         {
-            const float len = 1.0f / std::sqrt((mulNoFma(nr[0], nr[0]) + mulNoFma(nr[1], nr[1])) + mulNoFma(nr[2], nr[2]));
-            for (float &x : nr)
-                x = mulNoFma(x, len);
+            scr[c] = vuMadd(vuMul(v[c], nb.scale[c]), nb.offset[c], 1.0f);
+            colour[c] = C[c];
         }
-        float L[4], lc[3];
-        for (int c = 0; c < 4; ++c)
-            L[c] = vuMadd(vuMadd(vuMul(nb.lightDir[0][c], nr[0]), nb.lightDir[1][c], nr[1]), nb.lightDir[2][c], nr[2]);
-        for (int c = 0; c < 3; ++c)
-            lc[c] = madd4(nb.lightCol[0], nb.lightCol[1], nb.lightCol[2], nb.lightCol[3], L, c);
-        const float amount[4] = {std::max(lc[0], 0.0f), std::max(lc[1], 0.0f), std::max(lc[2], 0.0f), nb.rot[2][3]};
-        for (int c = 0; c < 4; ++c)
-            colour[c] = std::min(vuMadd(vuMul(C[c], amount[c]), nb.emissive[c], 1.0f), nb.rot[0][3]);
     }
     else
     {
-        for (int c = 0; c < 3; ++c)
-            colour[c] = mulNoFma(C[c], nb.rot[1][3]);
-        colour[3] = mulNoFma(C[3], nb.rot[2][3]);
+        float clip[4];
+        for (int c = 0; c < 4; ++c)
+            clip[c] = madd4(nb.mvp[0], nb.mvp[1], nb.mvp[2], nb.mvp[3], P, c);
+        // 1 / FLT_MAX is a denormal: the VU flushes it, and the vertex lands on the screen offset.
+        q = clip[3] == 0.0f ? std::numeric_limits<float>::max() : vuClamp(1.0f / clip[3]);
+        const float sp[4] = {vuClamp(mulNoFma(clip[0], q)), vuClamp(mulNoFma(clip[1], q)), vuClamp(mulNoFma(clip[2], q)), clip[3]};
+        for (int c = 0; c < 4; ++c)
+            scr[c] = vuMadd(vuMul(sp[c], nb.scale[c]), nb.offset[c], 1.0f);
+        if (lit)
+        {
+            float nr[3];
+            for (int c = 0; c < 3; ++c)
+                nr[c] = vuMadd(vuMadd(vuMul(nb.rot[0][c], N[0]), nb.rot[1][c], N[1]), nb.rot[2][c], N[2]);
+            if (normalize)
+            {
+                const float len = 1.0f / std::sqrt((mulNoFma(nr[0], nr[0]) + mulNoFma(nr[1], nr[1])) + mulNoFma(nr[2], nr[2]));
+                for (float &x : nr)
+                    x = mulNoFma(x, len);
+            }
+            float L[4], lc[3];
+            for (int c = 0; c < 4; ++c)
+                L[c] = vuMadd(vuMadd(vuMul(nb.lightDir[0][c], nr[0]), nb.lightDir[1][c], nr[1]), nb.lightDir[2][c], nr[2]);
+            for (int c = 0; c < 3; ++c)
+                lc[c] = madd4(nb.lightCol[0], nb.lightCol[1], nb.lightCol[2], nb.lightCol[3], L, c);
+            const float amount[4] = {std::max(lc[0], 0.0f), std::max(lc[1], 0.0f), std::max(lc[2], 0.0f), nb.rot[2][3]};
+            for (int c = 0; c < 4; ++c)
+                colour[c] = std::min(vuMadd(vuMul(C[c], amount[c]), nb.emissive[c], 1.0f), nb.rot[0][3]);
+        }
+        else
+        {
+            for (int c = 0; c < 3; ++c)
+                colour[c] = mulNoFma(C[c], nb.rot[1][3]);
+            colour[3] = mulNoFma(C[3], nb.rot[2][3]);
+        }
     }
-    auto ftoi = [](float v, float scale) { return static_cast<int32_t>(std::trunc(v * scale)); };
+    auto ftoi = [](float v, float scale)
+    {
+        const double x = static_cast<double>(v) * scale; // FTOIn saturates
+        return x >= 2147483647.0 ? std::numeric_limits<int32_t>::max()
+               : x <= -2147483648.0 ? std::numeric_limits<int32_t>::min()
+                                    : static_cast<int32_t>(x);
+    };
     int32_t xyzf[4], rgba[4];
     for (int c = 0; c < 4; ++c)
     {

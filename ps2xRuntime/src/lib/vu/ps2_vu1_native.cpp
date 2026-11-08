@@ -1,11 +1,13 @@
 #include "ps2_vu1_lifted.h"
 #include "runtime/gs/gs_types.h"
 
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 
 // Native C++ for Gitaroo Man's VU1 mesh renderer, entry 0x1B68 (99.9% of all VU1 work), in the
 // spirit of the Ace Combat 5 port's rn_vp: instead of executing the microprogram, read the vertex
@@ -40,11 +42,13 @@ namespace
 
     struct Settings
     {
-        bool on = true, verbose = false, corrupt = false, gpu = false;
+        bool on = true, verbose = false, corrupt = false, gpu = false, gpuVerify = false;
         Settings()
         {
             const char *g = std::getenv("PS2X_VU1_GPU");
             gpu = g && *g && std::strcmp(g, "0") != 0;
+            const char *gv = std::getenv("PS2X_VU1_GPU_VERIFY");
+            gpuVerify = gv && *gv && std::strcmp(gv, "0") != 0;
             const char *e = std::getenv("PS2X_VU1_NATIVE");
             on = !(e && std::strcmp(e, "0") == 0);
             const char *v = std::getenv("PS2X_VU1_VERIFY");
@@ -212,9 +216,25 @@ namespace
     };
 }
 
+namespace
+{
+    const Settings &settings()
+    {
+        static const Settings s;
+        return s;
+    }
+
+    uint32_t nextSerial()
+    {
+        static uint32_t s_serial = 0;
+        return ++s_serial ? s_serial : ++s_serial;
+    }
+}
+
 int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
 {
-    static const Settings s_settings;
+    const Settings &s_settings = settings();
+    vu.m_clipNative.reset();
     if (!s_settings.on)
         return kLiftNotLifted;
 
@@ -574,6 +594,18 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
         vi[13] = static_cast<int16_t>(outBase + 2);
         vu.m_state.pc = exit == Exit::Clip ? 0x2418u : 0x2430u;
         ++(exit == Exit::Clip ? g_stats.clipped : g_stats.extraPass);
+        if (s_settings.gpu && exit == Exit::Clip)
+        {
+            // The clipper's packets come from the emitter; emittedBatch describes them.
+            auto clipBatch = std::make_shared<NativeVu1Batch>();
+            clipBatch->mode = mode;
+            clipBatch->emitted = true;
+            std::memcpy(clipBatch->scale, s11, 16);
+            std::memcpy(clipBatch->offset, s12, 16);
+            vu.m_clipNative = std::move(clipBatch);
+            vu.m_clipTop = top;
+            vu.m_clipCount = n;
+        }
         return kLiftContinue;
     }
 
@@ -581,11 +613,10 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
     // transform and light the vertices itself (the packet is unchanged).
     if (s_settings.gpu)
     {
-        static uint32_t s_serial = 0;
         auto batch = std::make_shared<NativeVu1Batch>();
         batch->mode = mode;
         batch->count = n;
-        batch->serial = ++s_serial ? s_serial : ++s_serial;
+        batch->serial = nextSerial();
         for (int c = 0; c < 4; ++c)
         {
             batch->mvp[0][c] = m1[c];
@@ -645,4 +676,91 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
     vu.m_state.pc = 0x27E8u;
     ++g_stats.drawn;
     return kLiftEnd;
+}
+
+// The emitter (0x0688) writes, per vertex read at src (+0 clip position, +1.w Q, +2 STQ, +3 colour):
+// STQ = STQ.xyz * Q, RGBA = FTOI0(colour), XYZF = FTOI4((clip.xyz * Q, clip.w) * vf11 + vf12). Its
+// source is the batch's own slots (unclipped triangles of a strip or list) or the clipper's output
+// (266 or 326); rather than follow the program's registers this looks for the vertices that give
+// every word of the packet.
+std::shared_ptr<const NativeVu1Batch> VU1Lifted::emittedBatch(const VU1Interpreter &vu, const uint8_t *packet,
+                                                              uint32_t bytes)
+{
+    const NativeVu1Batch &clipBatch = *vu.m_clipNative;
+    if (!vu.m_activeVuData || bytes < 16u)
+        return nullptr;
+    uint64_t lo, hi;
+    std::memcpy(&lo, packet, 8);
+    std::memcpy(&hi, packet + 8, 8);
+    const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+    const bool eop = ((lo >> 15) & 1u) != 0u;
+    const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u), nreg = static_cast<uint32_t>(lo >> 60);
+    const uint32_t posReg = static_cast<uint32_t>((hi >> 8) & 0xFu);
+    if (!eop || flg != 0u || nreg != 3u || (hi & 0xFFu) != 0x12u || (posReg != 4u && posReg != 5u) || nloop == 0u ||
+        nloop > kMaxVertices || bytes != 16u + 48u * nloop)
+        return nullptr;
+
+    const uint8_t *mem = vu.m_activeVuData;
+    const uint32_t qmask = (vu.m_activeVuDataSize >> 4) - 1u;
+    const float *s11 = clipBatch.scale, *s12 = clipBatch.offset;
+    // Recomputes vertex k from the qwords at src; true if it gives the packet's words.
+    auto matches = [&](uint32_t src, uint32_t k)
+    {
+        float M[4][4];
+        for (uint32_t i = 0; i < 4u; ++i)
+            std::memcpy(M[i], mem + ((src + i) & qmask) * 16u, 16);
+        const float Q = vnrm(M[1][3]);
+        float v23[4], words[3][4];
+        for (int c = 0; c < 3; ++c)
+            v23[c] = mul(vnrm(M[0][c]), Q);
+        v23[3] = mul(vnrm(M[0][3]), 1.0f);
+        for (int c = 0; c < 3; ++c)
+            words[0][c] = mul(vnrm(M[2][c]), Q);
+        for (int c = 0; c < 4; ++c)
+        {
+            words[1][c] = vftoi(vnrm(M[3][c]), 1.0);
+            words[2][c] = vftoi(madd(mul(v23[c], s11[c]), s12[c], 1.0f), 16.0);
+        }
+        const uint8_t *want = packet + 16u + 48u * k;
+        return std::memcmp(words[0], want, 12) == 0 && std::memcmp(words[1], want + 16, 32) == 0;
+    };
+
+    const int previousRounding = std::fegetround();
+    std::fesetround(FE_TOWARDZERO);
+    uint32_t found = ~0u;
+    auto tryFrom = [&](uint32_t start)
+    {
+        for (uint32_t k = 0; k < nloop; ++k)
+            if (!matches(start + 4u * k, k))
+                return false;
+        found = start;
+        return true;
+    };
+    bool ok = tryFrom(266u) || tryFrom(326u);
+    for (uint32_t j = 0; !ok && j + nloop <= vu.m_clipCount; ++j)
+        ok = tryFrom(vu.m_clipTop + 4u * j);
+    std::fesetround(previousRounding);
+    static uint64_t s_found = 0, s_missed = 0;
+    ++(ok ? s_found : s_missed);
+    if (settings().gpuVerify && ((s_found + s_missed) & 0xFFFFu) == 0u)
+        std::fprintf(stderr, "[vu1-native] clipper packets described for the GPU: %llu, not: %llu\n",
+                     static_cast<unsigned long long>(s_found), static_cast<unsigned long long>(s_missed));
+    if (!ok)
+        return nullptr;
+
+    auto batch = std::make_shared<NativeVu1Batch>();
+    batch->mode = clipBatch.mode;
+    batch->emitted = true;
+    batch->count = nloop;
+    batch->serial = nextSerial();
+    std::memcpy(batch->scale, s11, 16);
+    std::memcpy(batch->offset, s12, 16);
+    batch->xyz2 = posReg == 5u;
+    for (uint32_t k = 0; k < nloop; ++k)
+    {
+        for (uint32_t i = 0; i < 4u; ++i)
+            std::memcpy(batch->in[k][i], mem + ((found + 4u * k + i) & qmask) * 16u, 16);
+        std::memcpy(batch->out[k], packet + 16u + 48u * k, 48);
+    }
+    return batch;
 }

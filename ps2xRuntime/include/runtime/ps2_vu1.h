@@ -229,6 +229,10 @@ private:
     XgkickPipeline m_xgkick{};
     // Attached to the next PATH1 packet this unit sends (the native 1B68 path, PS2X_VU1_GPU).
     std::shared_ptr<const NativeVu1Batch> m_pendingNative;
+    // A 1B68 batch continued to the clipper (PS2X_VU1_GPU): its constants and input slots, so the
+    // packets the emitter sends can be described for the GPU too (VU1Lifted::emittedBatch).
+    std::shared_ptr<const NativeVu1Batch> m_clipNative;
+    uint32_t m_clipTop = 0, m_clipCount = 0;
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
     std::array<uint64_t, 4> m_accReady{};

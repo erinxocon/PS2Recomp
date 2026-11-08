@@ -123,7 +123,10 @@ struct GSVertex
 };
 
 // Inputs of one VU1 mesh batch (microprogram entry 1B68, drawn without clipping), passed along
-// with its GIF packet so a GPU renderer can transform and light the vertices itself.
+// with its GIF packet so a GPU renderer can transform and light the vertices itself. With `emitted`,
+// one packet of a clipped batch instead: what the microprogram's emitter (0x0688) read for each
+// vertex it wrote -- clip position, (-, -, -, Q), STQ, colour -- of which only scale and offset are
+// needed besides.
 struct NativeVu1Batch
 {
     uint32_t mode = 0;           // render body: 0x1B80 lit, 0x1E10 lit + normalized, 0x2108 / 0x2280 prelit
@@ -138,6 +141,7 @@ struct NativeVu1Batch
     float emissive[4]{};         // data[25]
     float stqW = 0.0f;
     bool xyz2 = false;           // the packet's position register is XYZ2 (32-bit Z, fog from FOG), not XYZF2
+    bool emitted = false;
     float in[24][4][4]{};        // per vertex: position, normal, STQ, RGBA as loaded
     uint32_t out[24][3][4]{};    // per vertex: the packet's STQ, RGBA, XYZF words (for verification)
 };
