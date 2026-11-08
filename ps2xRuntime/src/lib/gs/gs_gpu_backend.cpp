@@ -132,8 +132,23 @@ float tz(precise double d)
     if (isinf(f) && !isinf(d)) f = uintBitsToFloat(floatBitsToUint(f) - 1u);
     return vuc(f);
 }
+// a + b truncated: the double sum of two floats can itself be rounded (operands of opposite sign
+// and very different size), so its error (TwoSum, exact) decides when the double is a float.
+float tzSum(float a, float b)
+{
+    precise double da = double(a), db = double(b);
+    precise double s = da + db;
+    precise double bb = s - da;
+    precise double err = (da - (s - bb)) + (db - bb);
+    precise float f = float(s);
+    precise double back = double(f);
+    bool beyond = abs(back) > abs(s) || (back == s && err != 0.0LF && (err < 0.0LF) != (s < 0.0LF));
+    if (f != 0.0 && !isinf(f) && beyond) f = uintBitsToFloat(floatBitsToUint(f) - 1u);
+    if (isinf(f)) f = uintBitsToFloat(floatBitsToUint(f) - 1u);
+    return f;
+}
 float vmul(float a, float b) { precise double d = double(a) * double(b); return tz(d); }
-float vadd(float a, float b) { precise double d = double(a) + double(b); return tz(d); }
+float vadd(float a, float b) { return vuc(tzSum(a, b)); }
 // acc + a * b as ps2_vu1_native.cpp's madd (VU1Interpreter's FMAC): the float result, unless it is
 // near the ends of the range, where the exact value decides (so -FLT_MAX + 2e40 is FLT_MAX).
 float tzRaw(precise double d)
@@ -146,7 +161,7 @@ float tzRaw(precise double d)
 }
 float vmadd(float acc, float a, float b)
 {
-    float r = tzRaw(double(acc) + double(tzRaw(double(a) * double(b))));
+    float r = tzSum(acc, tzRaw(double(a) * double(b)));
     uint e = (floatBitsToUint(r) >> 23) & 255u;
     if (e - 2u <= 251u) return r;
     precise double exact = double(acc) + double(a) * double(b);
@@ -200,7 +215,7 @@ void main()
         vDepthConst = aFogZconst.y;
         return;
     }
-    vec4 misc = K(17);                     // mode, STQ w, body (0 prelit, 1 lit, 2 emitted), normalize
+    vec4 misc = K(17);                     // mode, STQ from the packet, body (0 prelit, 1 lit, 2 emitted), normalize
     bool lit = misc.z > 0.5 && misc.z < 1.5;
     // Inputs as the VU reads them: an infinity bit pattern is +-FLT_MAX.
     vec4 P = vuc4(aP), N = vuc4(aN), T = vuc4(aT), C = vuc4(aC);
@@ -247,9 +262,10 @@ void main()
     float z = (xyz2 ? float(uint(xyzf.z)) : float((xyzf.z >> 4) & 0xFFFFFF)) * (1.0 / 4294967296.0);
     gl_Position = vec4(x / uTargetSize.x * 2.0 - 1.0, y / uTargetSize.y * 2.0 - 1.0, 0.0, 1.0);
     vColor = vec4(lowByte(colour.r), lowByte(colour.g), lowByte(colour.b), lowByte(colour.a));
-    // The GS frontend reads a Q of zero as 1 (GSFrontend, STQ).
-    float stqQ = vmul(T.z, q);
-    vStq = vec3(vmul(T.x, q), vmul(T.y, q), stqQ == 0.0 ? 1.0 : stqQ);
+    // An extra pass's STQ is the packet's (NativeVu1Batch::stqFromPacket). The GS frontend reads a Q
+    // of zero as 1 (GSFrontend, STQ).
+    vec3 stq = misc.y > 0.5 ? aT.xyz : vec3(vmul(T.x, q), vmul(T.y, q), vmul(T.z, q));
+    vStq = vec3(stq.xy, stq.z == 0.0 ? 1.0 : stq.z);
     vFog = xyz2 ? aMeshFog.x : float((xyzf.w >> 4) & 255);
     vDepth = z;
     vDepthFlat = z;
@@ -1924,7 +1940,7 @@ void GSGpuRenderer::AddMeshTriangle(const GSPrimitiveBatch &batch, bool zconst, 
             put(c);
         put(nb.emissive);
         const float body = nb.emitted ? 2.0f : lit ? 1.0f : 0.0f;
-        const float misc[4] = {static_cast<float>(nb.mode), nb.stqW, body, normalize ? 1.0f : 0.0f};
+        const float misc[4] = {static_cast<float>(nb.mode), nb.stqFromPacket ? 1.0f : 0.0f, body, normalize ? 1.0f : 0.0f};
         put(misc);
     }
     const float slot = static_cast<float>(m_meshConstants.size() / 4u / kMeshConstantTexels - 1u);
@@ -2110,7 +2126,9 @@ void GSGpuRenderer::CheckMeshVertex(const NativeVu1Batch &nb, const GSVertex &gv
         xyzf[c] = ftoi(scr[c], 16.0f);
         rgba[c] = ftoi(colour[c], 1.0f);
     }
-    const float st[3] = {vuClamp(mulNoFma(T[0], q)), vuClamp(mulNoFma(T[1], q)), vuClamp(mulNoFma(T[2], q))};
+    float st[3] = {vuClamp(mulNoFma(T[0], q)), vuClamp(mulNoFma(T[1], q)), vuClamp(mulNoFma(T[2], q))};
+    if (nb.stqFromPacket)
+        std::memcpy(st, nb.in[k][2], 12);
     const uint32_t *ostq = nb.out[k][0], *orgba = nb.out[k][1], *oxyzf = nb.out[k][2];
     // Only the bits the GS uses: X, Y 16 bits, Z 24 bits above 4, fog 8 bits above 4, colour bytes.
     bool ok = true;

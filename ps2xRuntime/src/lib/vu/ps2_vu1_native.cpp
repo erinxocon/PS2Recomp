@@ -235,6 +235,7 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
 {
     const Settings &s_settings = settings();
     vu.m_clipNative.reset();
+    vu.m_extraNative.reset();
     if (!s_settings.on)
         return kLiftNotLifted;
 
@@ -576,42 +577,9 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
     vi[14] = static_cast<int16_t>(outBase + 3 * static_cast<int32_t>(n + 1u));
     vi[15] = extraPass;
 
-    vu.m_cycle += (normalize ? 40u : 30u) + n * (normalize ? 32u : 26u);
-    if (culled)
-    {
-        ++g_stats.culled;
-        vi[2] = tagX;
-        vi[13] = static_cast<int16_t>(clipAnd);
-        vu.m_state.pc = 0x0020u;
-        return kLiftEnd;
-    }
-    if (exit != Exit::Kick)
-    {
-        // The lit modes add n to the tag count in the clip branch's delay slot; the unlit ones
-        // only after it.
-        const bool countAdded = exit == Exit::Clip && lit;
-        vi[2] = countAdded ? static_cast<int16_t>(tagX + static_cast<int32_t>(n)) : tagX;
-        vi[13] = static_cast<int16_t>(outBase + 2);
-        vu.m_state.pc = exit == Exit::Clip ? 0x2418u : 0x2430u;
-        ++(exit == Exit::Clip ? g_stats.clipped : g_stats.extraPass);
-        if (s_settings.gpu && exit == Exit::Clip)
-        {
-            // The clipper's packets come from the emitter; emittedBatch describes them.
-            auto clipBatch = std::make_shared<NativeVu1Batch>();
-            clipBatch->mode = mode;
-            clipBatch->emitted = true;
-            std::memcpy(clipBatch->scale, s11, 16);
-            std::memcpy(clipBatch->offset, s12, 16);
-            vu.m_clipNative = std::move(clipBatch);
-            vu.m_clipTop = top;
-            vu.m_clipCount = n;
-        }
-        return kLiftContinue;
-    }
-
     // PS2X_VU1_GPU: the packet carries the batch's inputs and constants so the GPU renderer can
     // transform and light the vertices itself (the packet is unchanged).
-    if (s_settings.gpu)
+    auto makeGpuBatch = [&]
     {
         auto batch = std::make_shared<NativeVu1Batch>();
         batch->mode = mode;
@@ -637,7 +605,6 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
             batch->lightCol[3][c] = c19[c];
             batch->emissive[c] = emissive[c];
         }
-        batch->stqW = stqW;
         {
             // The packet's register list (the template tag's REGS): which one carries the position.
             uint32_t lanes[4];
@@ -658,8 +625,50 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
             std::memcpy(batch->out[k][1], vo[k].rgba, 16);
             std::memcpy(batch->out[k][2], vo[k].xyzf, 16);
         }
-        vu.m_pendingNative = std::move(batch);
+        return batch;
+    };
+
+    vu.m_cycle += (normalize ? 40u : 30u) + n * (normalize ? 32u : 26u);
+    if (culled)
+    {
+        ++g_stats.culled;
+        vi[2] = tagX;
+        vi[13] = static_cast<int16_t>(clipAnd);
+        vu.m_state.pc = 0x0020u;
+        return kLiftEnd;
     }
+    if (exit != Exit::Kick)
+    {
+        // The lit modes add n to the tag count in the clip branch's delay slot; the unlit ones
+        // only after it.
+        const bool countAdded = exit == Exit::Clip && lit;
+        vi[2] = countAdded ? static_cast<int16_t>(tagX + static_cast<int32_t>(n)) : tagX;
+        vi[13] = static_cast<int16_t>(outBase + 2);
+        vu.m_state.pc = exit == Exit::Clip ? 0x2418u : 0x2430u;
+        ++(exit == Exit::Clip ? g_stats.clipped : g_stats.extraPass);
+        if (s_settings.gpu)
+        {
+            // An extra pass rewrites the output's STQ before the kick (extraPassBatch); the clipper's
+            // packets, after either branch, come from the emitter (emittedBatch).
+            if (exit == Exit::ExtraPass)
+            {
+                vu.m_extraNative = makeGpuBatch();
+                vu.m_extraNative->stqFromPacket = true;
+            }
+            auto clipBatch = std::make_shared<NativeVu1Batch>();
+            clipBatch->mode = mode;
+            clipBatch->emitted = true;
+            std::memcpy(clipBatch->scale, s11, 16);
+            std::memcpy(clipBatch->offset, s12, 16);
+            vu.m_clipNative = std::move(clipBatch);
+            vu.m_clipTop = top;
+            vu.m_clipCount = n;
+        }
+        return kLiftContinue;
+    }
+
+    if (s_settings.gpu)
+        vu.m_pendingNative = makeGpuBatch();
 
     // GIF tag (NLOOP += n), kick, swap the output buffers.
     const int16_t kickAt = static_cast<int16_t>(outBase + 2);
@@ -683,21 +692,66 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
 // source is the batch's own slots (unclipped triangles of a strip or list) or the clipper's output
 // (266 or 326); rather than follow the program's registers this looks for the vertices that give
 // every word of the packet.
+namespace
+{
+    // One packed GIF tag with STQ, RGBA, XYZF2 or XYZ2 per vertex, as 1B68 and the emitter send:
+    // the vertex count (0 if the packet is something else); xyz2 when the position is XYZ2.
+    uint32_t meshPacketVertices(const uint8_t *packet, uint32_t bytes, bool &xyz2)
+    {
+        if (bytes < 16u)
+            return 0u;
+        uint64_t lo, hi;
+        std::memcpy(&lo, packet, 8);
+        std::memcpy(&hi, packet + 8, 8);
+        const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+        const bool eop = ((lo >> 15) & 1u) != 0u;
+        const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u), nreg = static_cast<uint32_t>(lo >> 60);
+        const uint32_t posReg = static_cast<uint32_t>((hi >> 8) & 0xFu);
+        if (!eop || flg != 0u || nreg != 3u || (hi & 0xFFu) != 0x12u || (posReg != 4u && posReg != 5u) ||
+            nloop == 0u || nloop > kMaxVertices || bytes != 16u + 48u * nloop)
+            return 0u;
+        xyz2 = posReg == 5u;
+        return nloop;
+    }
+}
+
+std::shared_ptr<const NativeVu1Batch> VU1Lifted::extraPassBatch(VU1Interpreter &vu, const uint8_t *packet,
+                                                                uint32_t bytes)
+{
+    // Only the first packet after the extra pass can be its kick (with clipping it is the clipper's).
+    std::shared_ptr<NativeVu1Batch> owned = std::move(vu.m_extraNative);
+    vu.m_extraNative.reset();
+    NativeVu1Batch &batch = *owned;
+    bool xyz2 = false;
+    const uint32_t n = meshPacketVertices(packet, bytes, xyz2);
+    bool same = n == batch.count;
+    for (uint32_t k = 0; same && k < n; ++k)
+        same = std::memcmp(batch.out[k][1], packet + 16u + 48u * k + 16u, 32) == 0;
+    static uint64_t s_found = 0, s_missed = 0;
+    ++(same ? s_found : s_missed);
+    if (settings().gpuVerify && ((s_found + s_missed) & 0xFFFFu) == 0u)
+        std::fprintf(stderr, "[vu1-native] extra-pass packets described for the GPU: %llu, not: %llu\n",
+                     static_cast<unsigned long long>(s_found), static_cast<unsigned long long>(s_missed));
+    if (!same)
+        return nullptr;
+    batch.xyz2 = xyz2;
+    for (uint32_t k = 0; k < n; ++k)
+    {
+        std::memcpy(batch.in[k][2], packet + 16u + 48u * k, 16);
+        std::memcpy(batch.out[k][0], packet + 16u + 48u * k, 16);
+    }
+    return owned;
+}
+
 std::shared_ptr<const NativeVu1Batch> VU1Lifted::emittedBatch(const VU1Interpreter &vu, const uint8_t *packet,
                                                               uint32_t bytes)
 {
     const NativeVu1Batch &clipBatch = *vu.m_clipNative;
-    if (!vu.m_activeVuData || bytes < 16u)
+    if (!vu.m_activeVuData)
         return nullptr;
-    uint64_t lo, hi;
-    std::memcpy(&lo, packet, 8);
-    std::memcpy(&hi, packet + 8, 8);
-    const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
-    const bool eop = ((lo >> 15) & 1u) != 0u;
-    const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u), nreg = static_cast<uint32_t>(lo >> 60);
-    const uint32_t posReg = static_cast<uint32_t>((hi >> 8) & 0xFu);
-    if (!eop || flg != 0u || nreg != 3u || (hi & 0xFFu) != 0x12u || (posReg != 4u && posReg != 5u) || nloop == 0u ||
-        nloop > kMaxVertices || bytes != 16u + 48u * nloop)
+    bool xyz2 = false;
+    const uint32_t nloop = meshPacketVertices(packet, bytes, xyz2);
+    if (nloop == 0u)
         return nullptr;
 
     const uint8_t *mem = vu.m_activeVuData;
@@ -755,7 +809,7 @@ std::shared_ptr<const NativeVu1Batch> VU1Lifted::emittedBatch(const VU1Interpret
     batch->serial = nextSerial();
     std::memcpy(batch->scale, s11, 16);
     std::memcpy(batch->offset, s12, 16);
-    batch->xyz2 = posReg == 5u;
+    batch->xyz2 = xyz2;
     for (uint32_t k = 0; k < nloop; ++k)
     {
         for (uint32_t i = 0; i < 4u; ++i)

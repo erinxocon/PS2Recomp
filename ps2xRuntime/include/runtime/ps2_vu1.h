@@ -232,6 +232,8 @@ private:
     // A 1B68 batch continued to the clipper (PS2X_VU1_GPU): its constants and input slots, so the
     // packets the emitter sends can be described for the GPU too (VU1Lifted::emittedBatch).
     std::shared_ptr<const NativeVu1Batch> m_clipNative;
+    // A 1B68 batch continued to an extra pass, for its kick (VU1Lifted::extraPassBatch).
+    std::shared_ptr<NativeVu1Batch> m_extraNative;
     uint32_t m_clipTop = 0, m_clipCount = 0;
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};

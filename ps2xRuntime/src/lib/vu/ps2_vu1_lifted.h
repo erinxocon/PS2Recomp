@@ -66,6 +66,10 @@ struct VU1Lifted
     // (0x0688) wrote, found in VU memory by recomputing every packet word; null if they are not.
     static std::shared_ptr<const NativeVu1Batch> emittedBatch(const VU1Interpreter &vu, const uint8_t *packet,
                                                               uint32_t bytes);
+    // ps2_vu1_native.cpp: m_extraNative for its kick, if the packet has the batch's colours and
+    // positions (the extra pass changed only the STQ, which it then takes from the packet).
+    static std::shared_ptr<const NativeVu1Batch> extraPassBatch(VU1Interpreter &vu, const uint8_t *packet,
+                                                                uint32_t bytes);
     static int runLifted(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
                          uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t maxCycles);
     static void verifyExecute(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
