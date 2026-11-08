@@ -127,6 +127,13 @@ namespace
             }
         }
 
+        double outputDelayMs()
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const size_t fill = (m_write + m_ring.size() - m_read) % m_ring.size();
+            return static_cast<double>(fill / 2u) * 1000.0 / kSampleRate + m_deviceMs;
+        }
+
         void shutdown()
         {
 #if !defined(PLATFORM_VITA)
@@ -290,6 +297,7 @@ namespace
             }
             m_deviceOpen = true;
             const ma_uint32 buffered = m_device.playback.internalPeriodSizeInFrames * m_device.playback.internalPeriods;
+            m_deviceMs = buffered * 1000.0 / m_device.playback.internalSampleRate;
             std::printf("[audio] %s device, %u Hz, %u frames buffered (%.1f ms)\n",
                         ma_get_backend_name(m_device.pContext->backend), m_device.playback.internalSampleRate, buffered,
                         buffered * 1000.0 / m_device.playback.internalSampleRate);
@@ -408,6 +416,7 @@ namespace
         bool m_streamReady = false;
         bool m_deviceTried = false;
         bool m_deviceOpen = false;
+        double m_deviceMs = 96.0; // raylib stream: 1024-frame stream buffer plus raylib's ~75 ms device buffer
 #if !defined(PLATFORM_VITA)
         ma_device m_device{};
         AudioStream m_stream{};
@@ -439,6 +448,11 @@ PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
 {
     (void)Spu2HostOutput::instance();
     ps2x::iop::setAudioSink(&Spu2HostOutput::sink, nullptr);
+}
+
+double PS2AudioBackend::outputDelayMs() const
+{
+    return Spu2HostOutput::instance().outputDelayMs();
 }
 
 PS2AudioBackend::~PS2AudioBackend()

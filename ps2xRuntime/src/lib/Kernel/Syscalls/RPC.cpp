@@ -1,5 +1,8 @@
 #include <iostream>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include "Common.h"
@@ -561,6 +564,31 @@ namespace ps2_syscalls
             request.endParameter = endParameter;
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+
+            // PS2X_TRACE_MSTREAM=1: every call to the MSTREAM sound driver (SID 0x1563) with its
+            // payload and reply words, the vsync tick and host time, to find the game's song clock.
+            static const bool s_traceMstream = std::getenv("PS2X_TRACE_MSTREAM") != nullptr;
+            if (s_traceMstream && sid == 0x1563u)
+            {
+                auto words = [&](uint32_t addr, uint32_t size, uint32_t (&out)[4])
+                {
+                    for (uint32_t i = 0; i < 4u; ++i)
+                    {
+                        out[i] = 0u;
+                        if (addr != 0u && (i + 1u) * 4u <= size)
+                            if (const uint8_t *ptr = getConstMemPtr(rdram, addr + i * 4u))
+                                std::memcpy(&out[i], ptr, 4u);
+                    }
+                };
+                uint32_t sw[4], rw[4];
+                words(sendBuf, sendSize, sw);
+                words(receiveBuffer, receiveSize, rw);
+                static const auto s_start = std::chrono::steady_clock::now();
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s_start).count();
+                std::fprintf(stderr, "[mstream] t=%.1f tick=%llu fno=0x%x send=%08x %08x %08x %08x recv=%08x %08x %08x %08x\n", ms,
+                             static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), rpcNum, sw[0], sw[1],
+                             sw[2], sw[3], rw[0], rw[1], rw[2], rw[3]);
+            }
 
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
