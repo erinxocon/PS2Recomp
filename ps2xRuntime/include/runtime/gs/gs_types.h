@@ -137,6 +137,7 @@ struct NativeVu1Batch
     float lightCol[4][4]{};      // vf16-vf19
     float emissive[4]{};         // data[25]
     float stqW = 0.0f;
+    bool xyz2 = false;           // the packet's position register is XYZ2 (32-bit Z, fog from FOG), not XYZF2
     float in[24][4][4]{};        // per vertex: position, normal, STQ, RGBA as loaded
     uint32_t out[24][3][4]{};    // per vertex: the packet's STQ, RGBA, XYZF words (for verification)
 };

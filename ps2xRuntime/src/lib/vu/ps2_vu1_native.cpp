@@ -607,6 +607,19 @@ int VU1Lifted::runNative(VU1Interpreter &vu, LiftedRun &run)
             batch->emissive[c] = emissive[c];
         }
         batch->stqW = stqW;
+        {
+            // The packet's register list (the template tag's REGS): which one carries the position.
+            uint32_t lanes[4];
+            std::memcpy(lanes, tag, 16);
+            const uint32_t nreg = (lanes[1] >> 28) ? (lanes[1] >> 28) : 16u;
+            const uint64_t regs = static_cast<uint64_t>(lanes[2]) | (static_cast<uint64_t>(lanes[3]) << 32);
+            for (uint32_t r = 0; r < nreg; ++r)
+            {
+                const uint32_t id = static_cast<uint32_t>(regs >> (4u * r)) & 0xFu;
+                if (id == 0x5u)
+                    batch->xyz2 = true;
+            }
+        }
         std::memcpy(batch->in, inputs, sizeof(float) * 16u * n);
         for (uint32_t k = 0; k < n; ++k)
         {
