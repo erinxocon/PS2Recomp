@@ -127,23 +127,25 @@ void main()
     }
     vec4 misc = K(17);                     // mode, STQ w, lit, normalize
     bool lit = misc.z > 0.5;
-    vec4 clip = ((K(0) * aP.x + K(1) * aP.y) + K(2) * aP.z) + K(3) * aP.w;
+    // Inputs as the VU reads them: an infinity bit pattern is +-FLT_MAX.
+    vec4 P = vuClamp(aP), N = vuClamp(aN), T = vuClamp(aT), C = vuClamp(aC);
+    vec4 clip = ((K(0) * P.x + K(1) * P.y) + K(2) * P.z) + K(3) * P.w;
     float q = clip.w == 0.0 ? 3.4028235e38 : 1.0 / clip.w;
     vec4 sp = vuClamp(vec4(clip.xyz * q, clip.w));
     vec4 scr = vuClamp(sp * K(7)) + K(8);
     vec4 colour;
     if (lit)
     {
-        vec3 nr = ((K(4).xyz * aN.x + K(5).xyz * aN.y) + K(6).xyz * aN.z);
+        vec3 nr = ((K(4).xyz * N.x + K(5).xyz * N.y) + K(6).xyz * N.z);
         if (misc.w > 0.5)
             nr *= inversesqrt(dot(nr, nr));
         vec4 L = (K(9) * nr.x + K(10) * nr.y) + K(11) * nr.z;
         vec3 lc = ((K(12).xyz * L.x + K(13).xyz * L.y) + K(14).xyz * L.z) + K(15).xyz * L.w;
         vec4 amount = vec4(max(lc, vec3(0.0)), K(6).w);
-        colour = min(aC * amount + K(16), vec4(K(4).w));
+        colour = min(C * amount + K(16), vec4(K(4).w));
     }
     else
-        colour = vec4(aC.rgb * K(5).w, aC.a * K(6).w);
+        colour = vec4(C.rgb * K(5).w, C.a * K(6).w);
     // What the GS takes from the packed STQ, RGBA (FTOI0) and XYZF2 (FTOI4) words.
     vec4 xyzf = trunc(scr * 16.0);
     float x = float(int(xyzf.x) & 0xFFFF) / 16.0 - aMesh.y;
@@ -151,7 +153,7 @@ void main()
     float z = float((int(xyzf.z) >> 4) & 0xFFFFFF) * (1.0 / 4294967296.0);
     gl_Position = vec4(x / uTargetSize.x * 2.0 - 1.0, y / uTargetSize.y * 2.0 - 1.0, 0.0, 1.0);
     vColor = vec4(lowByte(colour.r), lowByte(colour.g), lowByte(colour.b), lowByte(colour.a));
-    vStq = vuClamp(vec4(aT.xyz * q, 0.0)).xyz;
+    vStq = vuClamp(vec4(T.xyz * q, 0.0)).xyz;
     vFog = float((int(xyzf.w) >> 4) & 255);
     vDepth = z;
     vDepthFlat = z;
@@ -1787,10 +1789,28 @@ namespace
     {
         return ((mulNoFma(m0[c], v[0]) + mulNoFma(m1[c], v[1])) + mulNoFma(m2[c], v[2])) + mulNoFma(m3[c], v[3]);
     }
+    // As the VU reads a register: denormals are zero, an infinity/NaN exponent is +-FLT_MAX.
+    float vuNorm(float v)
+    {
+        uint32_t b;
+        std::memcpy(&b, &v, 4);
+        const uint32_t e = b & 0x7F800000u;
+        if (e == 0u)
+            b &= 0x80000000u;
+        else if (e == 0x7F800000u)
+            b = (b & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&v, &b, 4);
+        return v;
+    }
+    // A VU result: overflow is +-FLT_MAX, a denormal is zero.
     float vuClamp(float v)
     {
         constexpr float kMax = std::numeric_limits<float>::max();
-        return std::isnan(v) ? v : std::clamp(v, -kMax, kMax);
+        if (std::isnan(v))
+            return v;
+        if (std::fabs(v) < std::numeric_limits<float>::min())
+            return std::signbit(v) ? -0.0f : 0.0f;
+        return std::clamp(v, -kMax, kMax);
     }
 }
 
@@ -1815,7 +1835,14 @@ void GSGpuRenderer::CheckMeshVertex(const NativeVu1Batch &nb, const GSVertex &gv
         ~RestoreRounding() { std::fesetround(mode); }
     } restore{savedRounding};
     const uint8_t k = gv.nativeIndex;
-    const float *P = nb.in[k][0], *N = nb.in[k][1], *T = nb.in[k][2], *C = nb.in[k][3];
+    float P[4], N[4], T[4], C[4];
+    for (int c = 0; c < 4; ++c)
+    {
+        P[c] = vuNorm(nb.in[k][0][c]);
+        N[c] = vuNorm(nb.in[k][1][c]);
+        T[c] = vuNorm(nb.in[k][2][c]);
+        C[c] = vuNorm(nb.in[k][3][c]);
+    }
     const bool lit = nb.mode == 0x1B80u || nb.mode == 0x1E10u;
     const bool normalize = nb.mode == 0x1E10u || nb.mode == 0x2280u;
     float clip[4], scr[4], colour[4];
